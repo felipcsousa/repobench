@@ -1,0 +1,51 @@
+version: 1
+repository:
+  provider: github
+  lookback_days: 180
+project:
+  languages:
+  - python
+  install_command: uv sync
+  build_command: null
+  test_command: pytest
+task_mining:
+  min_implementation_loc: 20
+  max_implementation_loc: 400
+  max_implementation_files: 8
+  supported_types:
+  - bugfix
+  - feature
+  require_test_change: true
+benchmark:
+  size: 24
+  dimensions:
+    task_type: 0.3
+    subsystem: 0.4
+    complexity: 0.3
+execution:
+  environment: docker
+  concurrency: 4
+  harbor_timeout: 600
+  network_mode: no-network
+verification:
+  test_globs:
+  - test_*.py
+  - '*_test.py'
+  - tests/**
+  - '*.test.ts'
+  - '*.test.tsx'
+  - '*.spec.ts'
+  - '*.spec.tsx'
+  - __tests__/**
+  - '*_test.go'
+  - '**/testdata/**'
+  - '*Test.java'
+  - '*Tests.java'
+  - '*IT.java'
+  - '**/src/test/**'
+  verifier_asset_globs:
+  - test/fixtures/**
+  - '**/__snapshots__/**'
+leakage:
+  mode: best_available
+agents: {}
