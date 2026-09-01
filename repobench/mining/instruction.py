@@ -20,7 +20,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from repobench.core.types import PRInfo
+from repobench.core.types import IssueInfo, PRInfo
 
 _PR_BODY_MIN_CHARS = 80
 _ISSUE_BODY_MAX_CHARS = 4000
@@ -46,10 +46,25 @@ def _looks_contaminated(body: str) -> bool:
     )
 
 
+def _predates_pr(issue: IssueInfo, pr: PRInfo) -> bool:
+    """Tier A requires the linked issue to exist before the implementation (PRD §71).
+
+    Compared against the PR creation time, falling back to the merge time (the
+    issue certainly predates the solution). Unverifiable timestamps downgrade —
+    a pre-solution claim is never made without evidence.
+    """
+    if issue.created_at is None:
+        return False
+    boundary = pr.created_at or pr.merged_at
+    if boundary is None:
+        return False
+    return issue.created_at <= boundary
+
+
 def derive_instruction(pr: PRInfo) -> InstructionResult | None:
     """Best available instruction text for a PR, or None when provenance is absent."""
     issue = pr.linked_issue
-    if issue is not None:
+    if issue is not None and _predates_pr(issue, pr):
         text = f"{issue.title}\n\n{(issue.body or '')[:_ISSUE_BODY_MAX_CHARS]}".strip()
         if text:
             return InstructionResult(text=text, source="issue", confidence="A")

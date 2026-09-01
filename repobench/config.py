@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
@@ -16,7 +15,6 @@ CONFIG_FILENAME = "repobench.yml"
 
 
 class RepositoryConfig(BaseModel):
-    provider: str = "github"
     lookback_days: int = 180
 
 
@@ -24,7 +22,6 @@ class ProjectConfig(BaseModel):
     language: str | None = None
     package_manager: str | None = None
     install_command: str | None = None
-    build_command: str | None = None
     test_command: str | None = None
     regression_command: str | None = None
 
@@ -34,7 +31,6 @@ class TaskMiningConfig(BaseModel):
     min_implementation_loc: int = 20
     max_implementation_loc: int = 400
     max_implementation_files: int = 8
-    max_test_loc: int | None = None
     small_loc_max: int = 50
     large_loc_min: int = 200
     large_files_min: int = 5
@@ -49,7 +45,6 @@ class BenchmarkDimensions(BaseModel):
 class BenchmarkConfig(BaseModel):
     size: int = 24
     dimensions: BenchmarkDimensions = Field(default_factory=BenchmarkDimensions)
-    include_confidence_c: bool = False
     # None keeps every instruction tier (A/B/C/D); an explicit list (e.g.
     # ["A", "B"]) restricts the benchmark pool to those instruction
     # confidence tiers before validation.
@@ -79,8 +74,16 @@ class ExecutionConfig(BaseModel):
     # minute-granularity waits.
     timeout_seconds: int | None = None
     keep_workspaces: bool = False
-    environment: Literal["inherit"] = "inherit"
+    # Persisted trust for generic-command targets (PRD §26): the run preview
+    # still shows every command template, but the explicit gate is skipped.
+    trust_custom_commands: bool = False
     scrub_ssh_agent: bool = True
+
+
+class AnalysisConfig(BaseModel):
+    """Report statistics knobs (PRD §104: the paired-bootstrap seed is stored)."""
+
+    bootstrap_seed: int = 42
 
 
 class PricingRule(BaseModel):
@@ -99,6 +102,7 @@ class RepoBenchConfig(BaseModel):
         default_factory=InstructionGenerationConfig
     )
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    analysis: AnalysisConfig = Field(default_factory=AnalysisConfig)
     targets: dict[str, ExecutionTarget] = Field(default_factory=dict)
     pricing: dict[str, PricingRule] = Field(default_factory=dict)
 
@@ -154,11 +158,6 @@ def _detect_js_test_framework(repo: Path) -> str | None:
     return None
 
 
-def _has_package_script(repo: Path, script: str) -> bool:
-    data = _read_package_json(repo)
-    return bool(data) and script in (data.get("scripts") or {})
-
-
 def detect_project_environment(repo: Path) -> ProjectConfig:
     """Best-effort environment detection (PRD §74). A suggestion the user can edit."""
     cfg = ProjectConfig()
@@ -206,8 +205,6 @@ def detect_project_environment(repo: Path) -> ProjectConfig:
         else:
             cfg.test_command = "npm test"
         cfg.regression_command = cfg.test_command
-        if _has_package_script(repo, "build"):
-            cfg.build_command = f"{pm} run build"
     return cfg
 
 

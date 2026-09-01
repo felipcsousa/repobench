@@ -54,6 +54,20 @@ class GitHubClient:
     def _run(self, argv: list[str]) -> ProcessResult:
         return run_sync(argv, Path.cwd(), timeout_seconds=_GH_TIMEOUT_SECONDS)
 
+    def visibility(self) -> str | None:
+        """"PUBLIC" | "PRIVATE" | None (unknown). Never raises (PRD §51)."""
+        result = self._run(
+            ["gh", "repo", "view", self.slug, "--json", "visibility"]
+        )
+        if result.exit_code != 0 or not result.stdout.strip():
+            return None
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return None
+        value = data.get("visibility") if isinstance(data, dict) else None
+        return str(value).upper() if isinstance(value, str) else None
+
     def get_pr(self, number: int) -> PRInfo | None:
         result = self._run(
             ["gh", "pr", "view", str(number), "-R", self.slug, "--json", _PR_FIELDS]

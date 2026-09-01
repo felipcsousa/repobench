@@ -38,7 +38,7 @@ from repobench.core.types import (
 from repobench.execution.adapters.base import HarnessAdapter
 from repobench.execution.adapters.registry import get_adapter
 from repobench.execution.environment import TrialEnvironment
-from repobench.execution.process import run_process
+from repobench.execution.process import MAX_OUTPUT_BYTES, run_process
 from repobench.execution.usage import resolve_cost
 from repobench.execution.workspace import (
     Workspace,
@@ -54,6 +54,42 @@ _LOG = logging.getLogger("repobench.execution.runner")
 _INSTALL_TIMEOUT_SECONDS = 1800
 _VERIFIER_TIMEOUT_SECONDS = 1800
 _ERROR_TAIL_CHARS = 1500
+
+# Harness version probed once per process (PRD §29): the same adapter would
+# otherwise re-run `--version` for every trial of the same run.
+_HARNESS_VERSION_CACHE: dict[str, str | None] = {}
+
+
+def cached_harness_version(adapter: HarnessAdapter) -> str | None:
+    key = adapter.name
+    if key not in _HARNESS_VERSION_CACHE:
+        try:
+            _HARNESS_VERSION_CACHE[key] = adapter.version()
+        except Exception as exc:
+            _LOG.warning("harness %s: version probe failed: %s", key, exc)
+            _HARNESS_VERSION_CACHE[key] = None
+    return _HARNESS_VERSION_CACHE[key]
+
+
+def harness_version_snapshot() -> dict[str, str | None]:
+    """Copy of the per-process version cache — used by run manifests (PRD §30)."""
+    return dict(_HARNESS_VERSION_CACHE)
+
+
+def _write_output_artifact(path: Path, text: str) -> None:
+    """Best-effort capped write (PRD §121): output artifacts must never break a trial.
+
+    The cap mirrors process.py's capture cap (MAX_OUTPUT_BYTES, tail kept) so a
+    future raise of one constant covers capture and artifacts together.
+    """
+    try:
+        data = text.encode("utf-8", errors="replace")
+        if len(data) > MAX_OUTPUT_BYTES:
+            data = data[-MAX_OUTPUT_BYTES:]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    except OSError as exc:
+        _LOG.warning("output artifact write failed (%s): %s", path, exc)
 
 
 def build_task_prompt(instruction: str, workspace: Path) -> str:
@@ -156,6 +192,7 @@ class TrialExecutor:
             "task_id": task.task_id,
             "target_id": target.id,
             "harness": adapter.name,
+            "harness_version": cached_harness_version(adapter),
             "model": target.model,
             "provider": target.provider,
             "started_at": started_at,
@@ -257,6 +294,13 @@ class TrialExecutor:
             # usage stays unknown, never invented (PRD §54) — but never silently
             _LOG.warning("trial %s: usage parse failed: %s", trial_id, exc)
 
+        # 6b. OUTPUT ARTIFACTS (PRD §121): capped stdout/stderr live on disk next
+        # to trial.json/prompt.md/agent.patch; the result records their paths.
+        stdout_path = artifacts_dir / "trials" / trial_id / "stdout.log"
+        stderr_path = artifacts_dir / "trials" / trial_id / "stderr.log"
+        _write_output_artifact(stdout_path, proc.stdout)
+        _write_output_artifact(stderr_path, proc.stderr)
+
         # 8. CAPTURE PATCH (working tree vs synthetic BASE, commits included)
         files_changed = loc_added = loc_removed = None
         agent_patch = None
@@ -308,6 +352,8 @@ class TrialExecutor:
             loc_removed=loc_removed,
             agent_patch=agent_patch,
             prompt_path=prompt_path_str,
+            stdout_path=str(stdout_path),
+            stderr_path=str(stderr_path),
             workspace=str(ws.repo_dir),
             error=error,
         )

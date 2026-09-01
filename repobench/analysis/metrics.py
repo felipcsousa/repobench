@@ -133,6 +133,9 @@ def aggregate_trials(trials: list[TrialResult]) -> dict[str, TargetMetrics]:
     return {target_id: _aggregate_one(target_id, grouped[target_id]) for target_id in sorted(grouped)}
 
 
+_SEGMENT_DIMENSIONS = ("task_type", "subsystem", "complexity", "instruction_confidence")
+
+
 def _segment_value(task, dimension: str) -> str:
     if dimension == "task_type":
         return task.assessment.task_type.value
@@ -140,6 +143,8 @@ def _segment_value(task, dimension: str) -> str:
         return task.assessment.subsystem
     if dimension == "complexity":
         return task.assessment.complexity.value
+    if dimension == "instruction_confidence":
+        return task.assessment.instruction_confidence
     raise ValueError(f"unknown segmentation dimension: {dimension!r}")
 
 
@@ -153,7 +158,7 @@ def segment_breakdown(
     Trials whose task_id is absent from `tasks` are skipped; segments with
     n < 5 carry low_sample=True and are descriptive only (PRD §110).
     """
-    if dimension not in ("task_type", "subsystem", "complexity"):
+    if dimension not in _SEGMENT_DIMENSIONS:
         raise ValueError(f"unknown segmentation dimension: {dimension!r}")
     grouped: dict[str, dict[str, list[TrialResult]]] = {}
     for trial in trials:

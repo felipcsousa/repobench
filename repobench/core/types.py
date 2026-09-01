@@ -293,7 +293,13 @@ class TrialResult(BaseModel):
     harness_version: str | None = None
     model: str | None = None
     provider: str | None = None
-    outcome: TrialOutcome = TrialOutcome.HARNESS_ERROR
+    # Required since 0.4.0: every construction site names its outcome — the old
+    # HARNESS_ERROR default silently mislabeled results built without one.
+    outcome: TrialOutcome
+    # Harness output artifacts (PRD §121): capped stdout/stderr written next to
+    # trial.json; paths recorded so audit tooling can find them.
+    stdout_path: str | None = None
+    stderr_path: str | None = None
     started_at: datetime | None = None
     duration_ms: int = 0
     exit_code: int | None = None

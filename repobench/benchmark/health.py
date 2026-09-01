@@ -56,6 +56,15 @@ def _diversity_score(tasks: list[TaskMetadata]) -> int:
     return round(min(100.0, max(0.0, (subsystem_ratio + type_ratio) / 2 * 100)))
 
 
+# PRD §51: public repositories cannot rule out contamination — the warning
+# travels inside HealthReport so every report built from the benchmark carries it.
+PUBLIC_REPOSITORY_WARNING = (
+    "Public repository: the tested model may have seen this repository, its "
+    "issues or the solution — results measure practical performance, not "
+    "contamination-free capability (PRD §51)"
+)
+
+
 def compute_health(
     *,
     coverage: CoverageReport,
@@ -64,6 +73,7 @@ def compute_health(
     tasks: list[TaskMetadata],
     universe_counts: dict[str, int] | None = None,
     lookback_days: int = 180,
+    public_repository: bool = False,
     now: datetime | None = None,
 ) -> HealthReport:
     """Composite health (PRD §86) with honest limitations surfaced as warnings (PRD §87).
@@ -87,6 +97,8 @@ def compute_health(
     )
 
     warnings = ["No network isolation (host-native execution)"]
+    if public_repository:
+        warnings.append(PUBLIC_REPOSITORY_WARNING)
     if universe_counts:
         total_universe = sum(universe_counts.values())
         n_sample = len(tasks)

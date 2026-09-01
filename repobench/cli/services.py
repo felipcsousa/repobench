@@ -3,29 +3,31 @@
 Commands stay thin: each one delegates to a function here, so tests (and the
 e2e suite) can drive exactly the same code paths as the CLI. Persistence lives
 at this layer only — the domain modules stay pure (PRD §114).
+
+Scope: project layout/init, analyze, benchmark build, run planning/execution.
+Report assembly lives in cli.reports; run inspection and .repobench/ GC in
+cli.maintenance.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import math
+import logging
+import shlex
 import shutil
 import statistics
-import sys
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
-from repobench.analysis.metrics import aggregate_trials, segment_breakdown
-from repobench.analysis.recommendation import recommend
-from repobench.analysis.stats import paired_bootstrap
 from repobench.benchmark.coverage import CoverageReport, coverage_report
 from repobench.benchmark.health import HealthReport, compute_health
-from repobench.benchmark.manifest import build_manifest, load_manifest, save_manifest
+from repobench.benchmark.manifest import build_manifest, save_manifest
 from repobench.benchmark.sampling import greedy_stratified_sample
 from repobench.config import RepoBenchConfig, default_config_for
-from repobench.core.errors import RepoBenchError, UsageError
+from repobench.core.errors import UsageError
 from repobench.core.ids import new_run_id, new_task_id
 from repobench.core.paths import ProjectPaths, find_repo_root
 from repobench.core.types import (
@@ -39,11 +41,13 @@ from repobench.core.types import (
     TaskStatus,
     TrialOutcome,
     TrialResult,
+    utcnow,
 )
 from repobench.execution.adapters.registry import get_adapter
 from repobench.execution.runner import TrialExecutor, run_matrix
 from repobench.execution.workspace import WorkspaceManager
 from repobench.mining.candidates import mine_candidates
+from repobench.mining.subsystem import detect_package_dirs, load_codeowners
 from repobench.repository.git import GitRepo
 from repobench.repository.github import GitHubClient
 from repobench.repository.workload import (
@@ -156,6 +160,8 @@ class AnalyzeOutcome:
     merged_prs: int
     enrichment: str  # "github" | "local"
     remote_slug: str | None
+    # None = unknown (no gh / no remote); True triggers the PRD §51 warning.
+    public_repository: bool | None = None
 
 
 def _local_enricher(repo: GitRepo) -> Callable[[PRInfo], PRInfo]:
@@ -175,6 +181,15 @@ def _local_enricher(repo: GitRepo) -> Callable[[PRInfo], PRInfo]:
     return enrich
 
 
+# Cached per process (analyze and benchmark build share one probe — PRD §51).
+@lru_cache(maxsize=None)
+def repository_visibility(slug: str | None) -> str | None:
+    """PUBLIC | PRIVATE | None(unknown) via `gh repo view` — best-effort."""
+    if not slug or not shutil.which("gh"):
+        return None
+    return GitHubClient(slug).visibility()
+
+
 def analyze_repository(root: Path, cfg: RepoBenchConfig) -> AnalyzeOutcome:
     """Mine the Workload Universe and eval candidates (PRD §10, §65-66)."""
     repo = GitRepo(root)
@@ -192,6 +207,8 @@ def analyze_repository(root: Path, cfg: RepoBenchConfig) -> AnalyzeOutcome:
         cfg.task_mining,
         enrich=enrich,
         lookback_days=cfg.repository.lookback_days,
+        codeowners=load_codeowners(root),
+        package_dirs=detect_package_dirs(root),
     )
     pool = [c for c in candidates if c.status is not TaskStatus.FILTERED]
     summary = summarize_analysis(
@@ -203,6 +220,7 @@ def analyze_repository(root: Path, cfg: RepoBenchConfig) -> AnalyzeOutcome:
         merged_prs=len(merged),
         enrichment=enrichment,
         remote_slug=slug,
+        public_repository=(repository_visibility(slug) == "PUBLIC") if slug else None,
     )
 
 
@@ -469,6 +487,7 @@ def build_benchmark(
         tasks=sample,
         universe_counts=universe_counts,
         lookback_days=cfg.repository.lookback_days,
+        public_repository=repository_visibility(repo.remote_slug) == "PUBLIC",
     )
 
     manifest = build_manifest(
@@ -556,6 +575,40 @@ def validate_targets(targets: list[ExecutionTarget]) -> None:
             )
 
 
+def ensure_custom_command_trust(
+    storage: Storage,
+    targets: list[ExecutionTarget],
+    *,
+    trusted: bool,
+) -> None:
+    """The PRD §26 gate for generic-command targets.
+
+    A command target may only execute when the user passed
+    --trust-custom-command, persisted execution.trust_custom_commands in
+    repobench.yml, or the exact same command template already ran before
+    (registered in execution_targets at first execution). Anything else raises
+    UsageError listing every template for review.
+    """
+    untrusted: list[ExecutionTarget] = []
+    for target in targets:
+        if target.harness != "command" or trusted:
+            continue
+        registered = storage.get_target(target.id)
+        same_template = registered is not None and registered.get("command") == (
+            target.command or []
+        )
+        if not same_template:
+            untrusted.append(target)
+    if untrusted:
+        lines = [
+            "custom command targets are not trusted yet — review before first execution:",
+            *(f"  {t.id}: {shlex.join(t.command or [])}" for t in untrusted),
+            "re-run with --trust-custom-command or set "
+            "execution.trust_custom_commands: true in repobench.yml (PRD §26)",
+        ]
+        raise UsageError("\n".join(lines))
+
+
 def resolve_benchmark(storage: Storage, benchmark_id: str | None) -> dict:
     if benchmark_id:
         row = storage.get_benchmark(benchmark_id)
@@ -599,6 +652,18 @@ class RunPlan:
     keep_workspaces: bool
     is_resume: bool
     already_complete: int
+    retried: int = 0
+
+
+# Outcomes a plain --resume retries: infrastructure/transient failures, never a
+# verdict. TIMEOUT is retryable because it may reflect machine contention, not
+# the target's ability (issue #10). --retry-failed additionally retries UNSOLVED.
+_RETRYABLE_OUTCOMES = (
+    TrialOutcome.SETUP_ERROR,
+    TrialOutcome.VERIFIER_ERROR,
+    TrialOutcome.HARNESS_ERROR,
+    TrialOutcome.TIMEOUT,
+)
 
 
 def plan_run(
@@ -609,6 +674,7 @@ def plan_run(
     targets: list[ExecutionTarget],
     benchmark_id: str | None = None,
     resume: bool = False,
+    retry_failed: bool = False,
     jobs: int | None = None,
     keep: bool | None = None,
 ) -> RunPlan:
@@ -638,16 +704,21 @@ def plan_run(
         for trial in storage.list_trials(run_id):
             existing[(trial.task_id, trial.target_id)] = trial
 
-    retryable = (TrialOutcome.SETUP_ERROR, TrialOutcome.VERIFIER_ERROR)
+    retryable = set(_RETRYABLE_OUTCOMES)
+    if retry_failed:
+        retryable.add(TrialOutcome.UNSOLVED)
     pairs: list[tuple[TaskPackage, ExecutionTarget]] = []
     already_complete = 0
+    retried = 0
     for task in tasks:
         for target in targets:
             previous = existing.get((task.task_id, target.id))
-            if previous is not None and previous.outcome not in retryable:
+            if previous is None or previous.outcome in retryable:
+                if previous is not None:
+                    retried += 1
+                pairs.append((task, target))
+            else:
                 already_complete += 1
-                continue
-            pairs.append((task, target))
 
     return RunPlan(
         run_id=run_id,
@@ -660,6 +731,7 @@ def plan_run(
         keep_workspaces=keep_eff,
         is_resume=is_resume,
         already_complete=already_complete,
+        retried=retried,
     )
 
 
@@ -667,6 +739,55 @@ def plan_run(
 class RunOutcome:
     plan: RunPlan
     results: list[TrialResult]
+
+
+def _record_reproducibility(
+    storage: Storage,
+    paths: ProjectPaths,
+    *,
+    root: Path,
+    plan: RunPlan,
+    bootstrap_seed: int,
+) -> None:
+    """Persist the run's reproducibility record (PRD §29-31): register every
+    target's fingerprint (also the persisted trust anchor for generic-command
+    templates, PRD §26) and write runs/<id>/manifest.json. Best-effort — a
+    manifest write failure is logged, never fatal to the run."""
+    from repobench import __version__
+    from repobench.execution.fingerprint import (
+        build_run_manifest,
+        instruction_file_hashes,
+        target_fingerprint,
+    )
+    from repobench.execution.runner import cached_harness_version, harness_version_snapshot
+
+    for target in plan.targets:
+        fingerprint = target_fingerprint(target)
+        storage.save_target(
+            target.id,
+            definition_json=json.dumps(fingerprint["definition"]),
+            fingerprint_json=json.dumps(fingerprint),
+        )
+        # Probe harness versions now so the manifest (written before the matrix
+        # starts) already carries them; trial time reuses the same cache.
+        cached_harness_version(get_adapter(target.harness))
+
+    manifest = build_run_manifest(
+        run_id=plan.run_id,
+        benchmark_id=plan.benchmark_id,
+        targets=plan.targets,
+        harness_versions=harness_version_snapshot(),
+        instruction_hashes=instruction_file_hashes(root),
+        bootstrap_seed=bootstrap_seed,
+        started_at=utcnow().isoformat(),
+        repobench_version=__version__,
+    )
+    manifest_path = paths.run_dir(plan.run_id) / "manifest.json"
+    try:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+    except OSError as exc:
+        logging.getLogger("repobench.cli").warning("run manifest write failed: %s", exc)
 
 
 def execute_plan(
@@ -692,12 +813,14 @@ def execute_plan(
         on_result=storage.save_trial,
     )
 
+    bootstrap_seed = cfg.analysis.bootstrap_seed
     config_json = json.dumps(
         {
             "benchmark_id": plan.benchmark_id,
             "jobs": plan.jobs,
             "timeout_minutes": plan.timeout_minutes,
             "keep_workspaces": plan.keep_workspaces,
+            "bootstrap_seed": bootstrap_seed,
             "targets": [t.id for t in plan.targets],
         }
     )
@@ -709,6 +832,10 @@ def execute_plan(
         )
     else:
         storage.create_run(plan.run_id, plan.benchmark_id, config_json=config_json)
+
+    _record_reproducibility(
+        storage, paths, root=root, plan=plan, bootstrap_seed=bootstrap_seed
+    )
 
     total = len(plan.pairs)
     done = 0
@@ -731,149 +858,3 @@ def execute_plan(
     )
     storage.finish_run(plan.run_id, status="COMPLETED")
     return RunOutcome(plan=plan, results=results)
-
-
-# --------------------------------------------------------------------- report
-
-
-def load_task_metadata(
-    paths: ProjectPaths, storage: Storage, task_ids: list[str]
-) -> dict[str, TaskMetadata]:
-    """Task metadata from on-disk packages, falling back to the tasks table."""
-    result: dict[str, TaskMetadata] = {}
-    for task_id in task_ids:
-        meta_file = paths.task_dir(task_id) / "metadata.json"
-        if meta_file.is_file():
-            try:
-                result[task_id] = TaskMetadata.model_validate_json(meta_file.read_text())
-                continue
-            except Exception:
-                pass
-        row = storage.get_task(task_id)
-        if row:
-            try:
-                result[task_id] = TaskMetadata.model_validate(row)
-            except Exception:
-                continue
-    return result
-
-
-def _best_quality_target(metrics: dict) -> str | None:
-    if not metrics:
-        return None
-    return min(
-        metrics,
-        key=lambda tid: (
-            -metrics[tid].solve_rate,
-            metrics[tid].time_p50_ms
-            if metrics[tid].time_p50_ms is not None
-            else math.inf,
-            tid,
-        ),
-    )
-
-
-def build_report_data(
-    root: Path, cfg: RepoBenchConfig, storage: Storage, *, run_id: str | None = None
-):
-    """Assemble ReportData for a run (PRD §104-112)."""
-    from repobench.reporting.models import PairComparison, ReportData
-
-    if run_id:
-        run_row = storage.get_run(run_id)
-        if run_row is None:
-            raise UsageError(f"unknown run: {run_id}")
-    else:
-        runs = storage.list_runs()
-        if not runs:
-            raise UsageError("no runs recorded — run `repobench run` first")
-        run_row = runs[0]
-
-    run_id_eff = run_row["run_id"]
-    benchmark_id = run_row.get("benchmark_id")
-    trials = storage.list_trials(run_id_eff)
-
-    benchmark = storage.get_benchmark(benchmark_id) if benchmark_id else None
-    benchmark_id = benchmark["benchmark_id"] if benchmark else benchmark_id
-    task_ids = storage.benchmark_task_ids(benchmark_id) if benchmark_id else []
-    paths = ProjectPaths(root)
-    tasks = load_task_metadata(paths, storage, task_ids)
-
-    metrics = aggregate_trials(trials)
-
-    comparisons: list[PairComparison] = []
-    comparison_maps: dict[tuple[str, str], dict] = {}
-    best_id = _best_quality_target(metrics)
-    if best_id is not None:
-        trials_best = [t for t in trials if t.target_id == best_id]
-        for other in sorted(metrics):
-            if other == best_id:
-                continue
-            trials_other = [t for t in trials if t.target_id == other]
-            boot = paired_bootstrap(trials_best, trials_other)
-            comparison_maps[(best_id, other)] = boot
-            comparisons.append(
-                PairComparison(
-                    target_a=best_id,
-                    target_b=other,
-                    diff_pp=boot["mean_diff_pp"],
-                    ci_lo_pp=boot["ci_lo_pp"],
-                    ci_hi_pp=boot["ci_hi_pp"],
-                    conclusive=boot["conclusive"],
-                )
-            )
-
-    recommendation = recommend(metrics, comparison_maps) if metrics else None
-
-    segments = {
-        dimension: segment_breakdown(trials, tasks, dimension)
-        for dimension in ("task_type", "subsystem", "complexity")
-    }
-
-    health: HealthReport | None = None
-    if benchmark and benchmark.get("health_json"):
-        try:
-            health = HealthReport.model_validate_json(benchmark["health_json"])
-        except Exception:
-            health = None
-
-    warnings = list(health.warnings) if health else []
-    if not any("network" in warning.lower() for warning in warnings):
-        warnings.append("No network isolation")
-
-    concurrency = None
-    if run_row.get("config_json"):
-        try:
-            concurrency = json.loads(run_row["config_json"]).get("jobs")
-        except Exception:
-            concurrency = None
-
-    # Single source of truth (PRD §89): the immutable manifest records the
-    # repository the benchmark was built from. GitRepo is only a fallback for
-    # runs whose benchmark row has no loadable manifest.
-    repository = None
-    manifest_path = benchmark.get("manifest_path") if benchmark else None
-    if manifest_path:
-        try:
-            repository = load_manifest(Path(manifest_path)).repository
-        except Exception:
-            repository = None
-    if repository is None and (root / ".git").exists():
-        try:
-            repository = GitRepo(root).remote_slug
-        except RepoBenchError:
-            repository = None
-
-    return ReportData(
-        benchmark_id=benchmark_id,
-        repository=repository,
-        run_id=run_id_eff,
-        tasks_total=len(task_ids),
-        health=health,
-        targets=[metrics[tid] for tid in sorted(metrics)],
-        comparisons=comparisons,
-        recommendation=recommendation,
-        segments=segments,
-        warnings=warnings,
-        concurrency=concurrency,
-    )

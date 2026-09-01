@@ -19,6 +19,8 @@ class ProjectPaths:
 
     @property
     def cache_dir(self) -> Path:
+        """Legacy location: nothing creates it anymore — kept so `repobench clean
+        --cache` can still remove trees left by older versions."""
         return self.repobench_dir / "cache"
 
     @property
@@ -40,7 +42,6 @@ class ProjectPaths:
     def ensure(self) -> None:
         for d in (
             self.repobench_dir,
-            self.cache_dir,
             self.tasks_dir,
             self.benchmarks_dir,
             self.runs_dir,
