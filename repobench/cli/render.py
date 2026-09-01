@@ -53,7 +53,7 @@ def render_analyze_summary(
     echo("")
     kv("Merged PRs", f"{outcome.merged_prs}")
     kv("Potential task candidates", f"{summary.task_candidates}")
-    kv("Eval candidates", str(sum(1 for c in outcome.candidates if c.status.value == "DISCOVERED")))
+    kv("Validated eval candidates", str(summary.validated_candidates))
     echo("")
     echo("Workload")
     echo("")
@@ -176,7 +176,21 @@ def render_benchmark_build(outcome) -> None:  # noqa: ANN001 - BenchmarkBuildOut
     echo(f"manifest: {outcome.manifest_path}")
 
 
+def render_public_repository_warning() -> None:
+    """The PRD §51 contamination warning block, verbatim in spirit."""
+    echo("")
+    echo("⚠ PUBLIC REPOSITORY")
+    echo("")
+    echo("This benchmark cannot guarantee that the tested model or agent has")
+    echo("never seen the repository, its issues or the solution.")
+    echo("")
+    echo("Results measure practical performance, not contamination-free capability.")
+    echo("")
+
+
 def render_run_preview(plan, benchmark_note: str) -> None:  # noqa: ANN001 - RunPlan
+    import shlex
+
     echo("")
     kv("Benchmark", plan.benchmark_id)
     kv("Tasks", str(len(plan.tasks)))
@@ -184,6 +198,12 @@ def render_run_preview(plan, benchmark_note: str) -> None:  # noqa: ANN001 - Run
     kv("Trials", str(len(plan.pairs)))
     if plan.already_complete:
         kv("Already complete", f"{plan.already_complete} (resuming)")
+    if getattr(plan, "retried", 0):
+        kv("Retrying", f"{plan.retried} previous trial(s)")
+    # Generic-command templates are always shown before execution (PRD §26).
+    for target in plan.targets:
+        if target.harness == "command":
+            kv(f"command[{target.id}]", shlex.join(target.command or []))
     kv("Execution", "local")
     kv("Concurrency", str(plan.jobs))
     kv("Timeout", f"{plan.timeout_minutes}m / trial")
@@ -226,6 +246,80 @@ def render_task_build_line(message: str) -> None:
     echo(f"  {message}")
 
 
+# --------------------------------------------------------------- runs / clean
+
+
+def _short_when(value: str | None) -> str:
+    return value.replace("T", " ")[:16] if value else "—"
+
+
+def render_runs_table(views) -> None:  # noqa: ANN001 - list[RunRowView]
+    table = RichTable(header_style="bold")
+    for column in ("RUN", "BENCHMARK", "STATUS", "STARTED", "FINISHED", "TARGETS", "TRIALS"):
+        table.add_column(column)
+    for view in views:
+        table.add_row(
+            view.run_id,
+            view.benchmark_id or "—",
+            view.status,
+            _short_when(view.started_at),
+            _short_when(view.finished_at),
+            str(view.targets),
+            f"{view.trials_done} ({view.trials_solved} solved)",
+        )
+    console.print(table)
+
+
+def render_run_show(view) -> None:  # noqa: ANN001 - RunShowView
+    echo(f"Run {view.row.run_id}")
+    echo("")
+    kv("Benchmark", view.row.benchmark_id or "—")
+    kv("Status", view.row.status)
+    kv("Started", _short_when(view.row.started_at))
+    kv("Finished", _short_when(view.row.finished_at))
+    echo("")
+    if not view.targets:
+        echo("(no trials recorded for this run)")
+        return
+    table = RichTable(header_style="bold")
+    for column in ("TARGET", "N", "SOLVED", "SOLVE RATE", "P50", "TIMEOUTS", "ERRORS"):
+        table.add_column(column)
+
+    def duration(ms) -> str:  # noqa: ANN001
+        return f"{ms / 1000:.0f}s" if ms is not None else "—"
+
+    for metrics in view.targets:
+        table.add_row(
+            metrics.target_id,
+            str(metrics.n),
+            str(metrics.solved),
+            f"{metrics.solve_rate * 100:.0f}%",
+            duration(metrics.time_p50_ms),
+            str(metrics.timeouts),
+            str(metrics.errors),
+        )
+    console.print(table)
+
+
+def render_clean_plan(plan, *, apply: bool) -> None:  # noqa: ANN001 - CleanPlan
+    if apply:
+        echo("repobench clean — removing")
+    else:
+        echo("repobench clean — would remove (dry-run; pass --apply to execute)")
+    echo("")
+    if plan.empty:
+        echo("nothing to clean")
+        return
+    for run_id in plan.run_ids:
+        echo(f"  run      {run_id} (artifacts + trials + run row)")
+    for directory in plan.workspace_dirs:
+        echo(f"  workspace {directory.name}/")
+    if plan.cache_dir is not None:
+        echo(f"  cache     {plan.cache_dir.name}/")
+    echo("")
+    echo(f"approx. {plan.freed_bytes / 1_048_576:.1f} MB freed")
+
+
 def config_summary_lines(cfg: RepoBenchConfig, root: Path) -> list[str]:
     project = cfg.project
     lines = [
@@ -235,8 +329,6 @@ def config_summary_lines(cfg: RepoBenchConfig, root: Path) -> list[str]:
     ]
     if project.install_command:
         lines.append(f"install:   {project.install_command}")
-    if project.build_command:
-        lines.append(f"build:     {project.build_command}")
     if project.test_command:
         lines.append(f"test:      {project.test_command}")
     lines.append("edit repobench.yml to adjust commands, targets and benchmark size.")

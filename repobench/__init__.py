@@ -5,4 +5,4 @@ benchmark suite, then runs the coding agents already installed and configured on
 local machine against it.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

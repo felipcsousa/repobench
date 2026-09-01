@@ -55,8 +55,14 @@ def mine_candidates(
     enrich: Callable[[PRInfo], PRInfo | None] | None = None,
     lookback_days: int = 180,
     now: datetime | None = None,
+    codeowners: dict[str, str] | None = None,
+    package_dirs: dict[str, str] | None = None,
 ) -> list[CandidateInfo]:
-    """Mine one repository pass: every merged PR becomes a candidate or a filtered one."""
+    """Mine one repository pass: every merged PR becomes a candidate or a filtered one.
+
+    `codeowners`/`package_dirs` feed subsystem inference (PRD §68); None falls
+    back to the first-path-segment heuristic.
+    """
     candidates: list[CandidateInfo] = []
     for pr in repo.merged_prs(lookback_days, now=now):
         effective = pr
@@ -97,7 +103,9 @@ def mine_candidates(
 
         task_type = classify_task_type(effective, changed_files)
         complexity = compute_complexity(impl_loc, implementation_files, packages_touched, cfg)
-        subsystem = infer_subsystem(changed_files)
+        subsystem = infer_subsystem(
+            changed_files, codeowners=codeowners, package_dirs=package_dirs
+        )
         instruction = derive_instruction(effective)
 
         # The assessment is built once per PR; every candidate outcome carries it.

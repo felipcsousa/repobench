@@ -127,7 +127,7 @@ def test_golden_path_init_analyze_build_run_report(
     assert storage.list_candidates()[0].status.value == "VALID"
 
     # -- run (PRD §96-99: preview + 2 trials with --yes) --------------------
-    result = _invoke("run", "fixer", "noop", "--yes")
+    result = _invoke("run", "fixer", "noop", "--yes", "--trust-custom-command")
     assert result.exit_code == 0, result.output
     assert "Network isolation" in result.output and "none" in result.output
     assert "SOLVED" in result.output and "UNSOLVED" in result.output
@@ -163,7 +163,7 @@ def test_run_requires_benchmark_and_known_targets(
 ) -> None:
     storage = _fast_forward(fixture_repo, fake_agent_path, monkeypatch)
 
-    missing_benchmark = runner.invoke(app, ["run", "fixer", "--yes", "--benchmark", "rb_b_nope"])
+    missing_benchmark = runner.invoke(app, ["run", "fixer", "--yes", "--trust-custom-command", "--benchmark", "rb_b_nope"])
     assert missing_benchmark.exit_code == 1
     assert "unknown benchmark" in missing_benchmark.output
 
@@ -193,14 +193,14 @@ def test_run_resume_skips_completed_trials(
     _fast_forward(fixture_repo, fake_agent_path, monkeypatch)
     storage = Storage(fixture_repo / ".repobench" / "state.db")
 
-    first = _invoke("run", "fixer", "--yes")
+    first = _invoke("run", "fixer", "--yes", "--trust-custom-command")
     assert first.exit_code == 0, first.output
     trials_after_first = storage.list_trials()
     assert len(trials_after_first) == 1
 
     # Resume re-runs nothing for the same target; adding a target executes only
     # the missing Task×Target pair under the same benchmark.
-    second = _invoke("run", "fixer", "noop", "--yes", "--resume")
+    second = _invoke("run", "fixer", "noop", "--yes", "--resume", "--trust-custom-command")
     assert second.exit_code == 0, second.output
     assert "resuming the latest run" in second.output
     assert "Already complete" in second.output
@@ -235,7 +235,7 @@ def test_adversarial_leaker_finds_no_solution_in_workspace(
     monkeypatch.setenv("GH_TOKEN", "ghp_fixture_secret")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_fixture_secret")
 
-    result = _invoke("run", "leaker", "--yes", "--keep-workspaces")
+    result = _invoke("run", "leaker", "--yes", "--trust-custom-command", "--keep-workspaces")
     assert result.exit_code == 0, result.output
     storage = Storage(fixture_repo / ".repobench" / "state.db")
     trials = [t for t in storage.list_trials() if t.target_id == "leaker"]

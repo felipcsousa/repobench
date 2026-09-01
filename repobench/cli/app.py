@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -288,6 +289,8 @@ def analyze(ctx: typer.Context) -> None:
         + f" · lookback {cfg.repository.lookback_days} days"
     )
     render.render_analyze_summary(outcome, outcome.summary.suggested_benchmark_size, lookback_note)
+    if outcome.public_repository:
+        render.render_public_repository_warning()
     render.echo("Next: repobench benchmark build")
 
 
@@ -403,7 +406,17 @@ def run(
     jobs: Optional[int] = typer.Option(None, "--jobs", help="Concurrent trials."),
     yes: bool = typer.Option(False, "--yes", help="Non-interactive mode for scripts."),
     resume: bool = typer.Option(
-        False, "--resume", help="Resume pending / infrastructure-failed trials of the latest run."
+        False, "--resume", help="Resume pending / infrastructure-failed / timed-out trials of the latest run."
+    ),
+    retry_failed: bool = typer.Option(
+        False,
+        "--retry-failed",
+        help="With --resume: also retry UNSOLVED trials (verdicts are re-measured).",
+    ),
+    trust_custom_command: bool = typer.Option(
+        False,
+        "--trust-custom-command",
+        help="Trust generic-command targets for this run (PRD §26).",
     ),
     keep_workspaces: bool = typer.Option(
         False, "--keep-workspaces", help="Keep trial workspaces under .repobench/workspaces/."
@@ -413,6 +426,7 @@ def run(
     """Execute Benchmark × Targets locally (PRD §96-99)."""
     from repobench.cli import render
     from repobench.cli.services import (
+        check_custom_command_trust,
         execute_plan,
         plan_run,
         resolve_targets,
@@ -428,6 +442,24 @@ def run(
         root, paths, cfg, storage = _service_context(ctx)
         targets = resolve_targets(cfg, list(target_ids or []), all_targets)
         validate_targets(targets)
+        # Trust gate (PRD §26): generic commands execute only with the flag,
+        # persisted config trust, or an identical previously-run template.
+        untrusted = check_custom_command_trust(
+            storage,
+            targets,
+            trusted=trust_custom_command or cfg.execution.trust_custom_commands,
+        )
+        if untrusted:
+            render.echo(
+                "custom command targets are not trusted yet — review before first execution:"
+            )
+            for target in untrusted:
+                render.echo(f"  {target.id}: {shlex.join(target.command or [])}")
+            _fail(
+                "re-run with --trust-custom-command or set "
+                "execution.trust_custom_commands: true in repobench.yml (PRD §26)"
+            )
+            return
         plan = plan_run(
             storage,
             paths,
@@ -435,6 +467,7 @@ def run(
             targets=targets,
             benchmark_id=benchmark,
             resume=resume,
+            retry_failed=retry_failed,
             jobs=jobs,
             keep=True if keep_workspaces else None,
         )
@@ -471,33 +504,130 @@ def run(
 def report(
     ctx: typer.Context,
     run_id: Optional[str] = typer.Option(None, help="Run id (default: latest)."),
-    format: str = typer.Option("text", "--format", help="text | json (html is P1)."),
+    format: str = typer.Option(
+        "text", "--format", help="text | json | jsonl | csv (html is P1)."
+    ),
 ) -> None:
     """Show the comparison report for a run (PRD §111-112)."""
     from repobench.cli import render
-    from repobench.cli.services import build_report_data
+    from repobench.cli.services import build_report_data, load_trial_export
     from repobench.core.errors import RepoBenchError
+    from repobench.reporting.export import render_csv, render_jsonl
     from repobench.reporting.json_report import render_json
     from repobench.reporting.terminal import render_report
 
     if format == "html":
         render.echo("HTML report is P1 (PRD §113)")
         return
-    if format not in ("text", "json"):
-        _fail(f"unknown report format: {format!r} (expected text | json)")
+    if format not in ("text", "json", "jsonl", "csv"):
+        _fail(f"unknown report format: {format!r} (expected text | json | jsonl | csv)")
         return
 
     try:
         root, _paths, cfg, storage = _service_context(ctx)
-        data = build_report_data(root, cfg, storage, run_id=run_id)
+        if format in ("jsonl", "csv"):
+            trials, tasks = load_trial_export(root, storage, run_id=run_id)
+        else:
+            data = build_report_data(root, cfg, storage, run_id=run_id)
     except RepoBenchError as exc:
         _fail(str(exc))
         return
 
     if format == "json":
         typer.echo(render_json(data))
+    elif format == "jsonl":
+        typer.echo(render_jsonl(trials, tasks), nl=False)
+    elif format == "csv":
+        typer.echo(render_csv(trials, tasks), nl=False)
     else:
         render.echo(render_report(data))
+
+
+# ----------------------------------------------------------------------- runs
+
+
+@app.command()
+def runs(
+    ctx: typer.Context,
+    show: Optional[str] = typer.Option(None, "--show", help="Per-target summary of one run id."),
+) -> None:
+    """List recorded runs, or inspect one with --show <id> (issue #4)."""
+    from repobench.cli import render
+    from repobench.cli.services import list_run_views, show_run_view
+    from repobench.core.errors import RepoBenchError
+
+    try:
+        root, _paths, _cfg, storage = _service_context(ctx)
+        if show:
+            view = show_run_view(storage, show)
+            render.render_run_show(view)
+            return
+        views = list_run_views(storage)
+    except RepoBenchError as exc:
+        _fail(str(exc))
+        return
+
+    if not views:
+        render.echo("no runs recorded — run `repobench run` first")
+        return
+    render.render_runs_table(views)
+
+
+# ---------------------------------------------------------------------- clean
+
+
+@app.command()
+def clean(
+    ctx: typer.Context,
+    runs_to_keep: Optional[int] = typer.Option(
+        None, "--runs", help="Keep only the N most recent runs (delete older runs + trials)."
+    ),
+    workspaces: bool = typer.Option(
+        False, "--workspaces", help="Remove leftover trial workspaces under .repobench/workspaces/."
+    ),
+    cache: bool = typer.Option(
+        False, "--cache", help="Remove the legacy .repobench/cache/ tree when present."
+    ),
+    all_scope: bool = typer.Option(
+        False, "--all", help="Every scope: all runs, workspaces and cache."
+    ),
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually delete — without it clean is a dry-run."
+    ),
+) -> None:
+    """Garbage-collect .repobench/ artifacts (dry-run by default, issue #9)."""
+    from repobench.cli import render
+    from repobench.cli.services import apply_clean, plan_clean
+    from repobench.core.errors import RepoBenchError
+
+    if all_scope:
+        workspaces = True
+        cache = True
+        if runs_to_keep is None:
+            runs_to_keep = 0  # --all drops every run unless --runs narrows it
+    if runs_to_keep is not None:
+        keep_runs: int | None = runs_to_keep
+    elif workspaces or cache:
+        keep_runs = None  # a scoped clean never touches runs implicitly
+    else:
+        keep_runs = 1  # plain `clean`: conservative preview, prune beyond the newest run
+    if keep_runs is not None and keep_runs < 0:
+        _fail("--runs must be >= 0")
+        return
+
+    try:
+        root, paths, _cfg, storage = _service_context(ctx)
+        plan = plan_clean(
+            storage, paths, keep_runs=keep_runs, workspaces=workspaces, cache=cache
+        )
+    except RepoBenchError as exc:
+        _fail(str(exc))
+        return
+
+    render.render_clean_plan(plan, apply=apply)
+    if apply and not plan.empty:
+        apply_clean(storage, plan)
+        render.echo(f"cleaned {len(plan.run_ids)} run(s), {len(plan.workspace_dirs)} workspace(s)")
 
 
 def run_cli() -> None:

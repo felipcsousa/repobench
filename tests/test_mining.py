@@ -3,6 +3,7 @@ instruction provenance, and end-to-end candidate mining over temporary git repos
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -216,18 +217,55 @@ def test_subsystem_stable_segment_and_fallbacks() -> None:
 # ---------------------------------------------------------------- instruction
 
 
+PR_AT = datetime(2026, 8, 1, tzinfo=timezone.utc)
+ISSUE_AT = PR_AT - timedelta(days=3)  # the issue predates the PR (PRD §71)
+
+
 def test_instruction_from_linked_issue_is_confidence_a() -> None:
     pr = PRInfo(
         number=1,
         title="Fix charge",
         body="x" * 100,
-        linked_issue=IssueInfo(number=5, title="Cart totals wrong", body="Reproduce by mixing items."),
+        created_at=PR_AT,
+        linked_issue=IssueInfo(
+            number=5,
+            title="Cart totals wrong",
+            body="Reproduce by mixing items.",
+            created_at=ISSUE_AT,
+        ),
     )
     result = derive_instruction(pr)
     assert result is not None
     assert result.confidence == "A"
     assert result.source == "issue"
     assert result.text.startswith("Cart totals wrong")
+
+
+def test_instruction_issue_created_with_pr_does_not_get_tier_a() -> None:
+    # Same-day issue (created after the PR) is NOT pre-solution intent (PRD §71)
+    # — the instruction falls through to the PR body/title tiers.
+    pr = PRInfo(
+        number=1,
+        title="Fix charge",
+        created_at=PR_AT,
+        linked_issue=IssueInfo(
+            number=5, title="Cart totals wrong", created_at=PR_AT + timedelta(hours=1)
+        ),
+    )
+    result = derive_instruction(pr)
+    assert result is not None and result.confidence == "C"  # title fallback
+    assert result.source == "title"
+
+
+def test_instruction_issue_without_timestamps_does_not_get_tier_a() -> None:
+    # Unverifiable provenance never claims tier A (PRD §71).
+    pr = PRInfo(
+        number=1,
+        title="Fix charge",
+        linked_issue=IssueInfo(number=5, title="Cart totals wrong"),
+    )
+    result = derive_instruction(pr)
+    assert result is not None and result.confidence == "C"
 
 
 def test_instruction_long_clean_body_is_confidence_b() -> None:
@@ -272,7 +310,13 @@ def test_instruction_absent() -> None:
 
 def test_instruction_issue_body_trimmed_to_4000() -> None:
     result = derive_instruction(
-        PRInfo(number=1, linked_issue=IssueInfo(number=2, title="t", body="x" * 5000))
+        PRInfo(
+            number=1,
+            created_at=PR_AT,
+            linked_issue=IssueInfo(
+                number=2, title="t", body="x" * 5000, created_at=ISSUE_AT
+            ),
+        )
     )
     assert result is not None
     assert len(result.text) == len("t\n\n") + 4000

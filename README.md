@@ -79,7 +79,9 @@ repobench analyze           # mine merged PRs into eval candidates (no tokens us
 repobench candidates        # inspect what was found and what was filtered
 repobench benchmark build   # reconstruct + validate tasks, sample a benchmark
 repobench run claude codex glm   # or: repobench run --all
-repobench report            # text; --format json for CI/dashboards
+repobench runs              # list recorded runs; --show <id> for per-target detail
+repobench report            # text; --format json | jsonl | csv for CI/dashboards
+repobench clean --runs 5 --apply   # GC old runs/workspaces (dry-run by default)
 ```
 
 `repobench.yml` starts from detected suggestions — test commands, package manager,
@@ -221,6 +223,20 @@ targets:
       - "{prompt_file}"
     output: text
 ```
+
+Custom commands are explicit local code, so the first execution is gated: the run
+preview always shows the exact template, and the run requires
+`--trust-custom-command` (or `execution.trust_custom_commands: true` in
+repobench.yml). The exact template that already ran once is trusted thereafter;
+any change to it re-arms the gate.
+
+## Reproducibility
+
+Native Mode measures your local configuration, so every run records what ran:
+`runs/<id>/manifest.json` captures the RepoBench version, OS/arch, harness
+versions, a config hash per target and the hashes of repository instruction files
+(AGENTS.md/CLAUDE.md/GEMINI.md) — never credential contents. Each trial persists
+its prompt, stdout/stderr and agent patch under `runs/<id>/trials/<trial>/`.
 
 ## Documentation
 

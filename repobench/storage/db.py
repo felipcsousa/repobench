@@ -287,6 +287,28 @@ class Storage:
             rows = self.query("SELECT data_json FROM trials ORDER BY created_at")
         return [TrialResult.model_validate_json(r["data_json"]) for r in rows]
 
+    def trials_by_run(self) -> dict[str, dict[str, dict[str, int]]]:
+        """run_id -> target_id -> {n, solved, timeouts, errors} in one grouped query."""
+        rows = self.query(
+            "SELECT run_id, target_id, outcome, COUNT(*) AS n FROM trials "
+            "GROUP BY run_id, target_id, outcome"
+        )
+        result: dict[str, dict[str, dict[str, int]]] = {}
+        for row in rows:
+            if not row["run_id"]:
+                continue
+            target = result.setdefault(row["run_id"], {}).setdefault(
+                row["target_id"], {"n": 0, "solved": 0, "timeouts": 0, "errors": 0}
+            )
+            target["n"] += row["n"]
+            if row["outcome"] == "SOLVED":
+                target["solved"] += row["n"]
+            elif row["outcome"] == "TIMEOUT":
+                target["timeouts"] += row["n"]
+            elif row["outcome"] in ("HARNESS_ERROR", "SETUP_ERROR", "VERIFIER_ERROR"):
+                target["errors"] += row["n"]
+        return result
+
     # -- targets --
 
     def save_target(
@@ -298,3 +320,16 @@ class Storage:
             "fingerprint_json": fingerprint_json,
             "created_at": utcnow().isoformat(),
         })
+
+    def get_target(self, target_id: str) -> dict[str, Any] | None:
+        """Decoded definition_json of a registered target, or None (PRD §26/§29)."""
+        rows = self.query(
+            "SELECT definition_json FROM execution_targets WHERE target_id = ?", (target_id,)
+        )
+        if not rows or not rows[0]["definition_json"]:
+            return None
+        try:
+            decoded = json.loads(rows[0]["definition_json"])
+        except json.JSONDecodeError:
+            return None
+        return decoded if isinstance(decoded, dict) else None

@@ -5,10 +5,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from repobench.analysis.metrics import SegmentStat, TargetMetrics
+from repobench.analysis.pareto import ParetoResult
 from repobench.analysis.recommendation import Recommendation
 from repobench.analysis.stats import wilson_ci
 from repobench.benchmark.health import HealthReport
 from repobench.reporting import (
+    InstructionGenerationStats,
     PairComparison,
     ReportData,
     render_json,
@@ -89,6 +91,7 @@ def sample_report_data() -> ReportData:
                 "conclusively worse than claude (best observed quality, 80% solve rate)."
             ),
         ),
+        pareto=ParetoResult(frontier=["claude", "codex", "glm"], axes="quality-cost"),
         segments={
             "task_type": {
                 "bugfix": {
@@ -99,12 +102,21 @@ def sample_report_data() -> ReportData:
                 "feature": {
                     "claude": SegmentStat(n=8, solved=6, rate=0.75, low_sample=False),
                     "codex": SegmentStat(n=8, solved=6, rate=0.75, low_sample=False),
-                    "glm": SegmentStat(n=8, solved=4, rate=0.5, low_sample=False),
+                    "glm": SegmentStat(n=8, solved=4, rate=0.4, low_sample=False),
+                },
+            },
+            "instruction_confidence": {
+                "A": {
+                    "claude": SegmentStat(n=10, solved=8, rate=0.8, low_sample=False),
+                    "codex": SegmentStat(n=10, solved=7, rate=0.7, low_sample=False),
+                    "glm": SegmentStat(n=10, solved=5, rate=0.5, low_sample=False),
                 },
             },
         },
+        instruction_generation=InstructionGenerationStats(generated=3, failed=1),
         warnings=["No network isolation (host-native execution)"],
         concurrency=4,
+        bootstrap_seed=42,
         generated_at=GENERATED_AT,
     )
 
@@ -140,6 +152,49 @@ class TestTerminalReport:
         text = render_report(sample_report_data())
         assert "Cost-effective recommendation:" in text
         assert "codex" in text
+
+    def test_pareto_plot_rendering(self):
+        data = sample_report_data()
+        # Make codex dominated: lower quality than claude AND costlier than glm.
+        data.targets[1] = data.targets[1].model_copy(
+            update={
+                "cost_per_solve_usd": 2.0,
+                "total_cost_usd": 20.0,
+                "effective_cost_usd": 2.0,
+            }
+        )
+        data.pareto = ParetoResult(frontier=["claude", "glm"], axes="quality-cost")
+        text = render_report(data)
+        assert "Pareto frontier — quality × cost" in text
+        assert "Frontier: claude, glm" in text
+        # quality axis labels and both axis extremes ($0.20–$2.00 effective cost)
+        assert "100%" in text and "  0%" in text
+        assert "$0.20" in text and "$2.00" in text
+        # the dominated target is still plotted, marked differently
+        assert "○" in text and "●" in text
+
+    def test_pareto_quality_time_axis_when_cost_absent(self):
+        data = sample_report_data()
+        for target in data.targets:
+            target.total_cost_usd = None
+            target.cost_per_solve_usd = None
+            target.cost_source = None
+            target.effective_cost_usd = None
+        data.pareto = ParetoResult(frontier=["claude"], axes="quality-time")
+        text = render_report(data)
+        assert "Pareto frontier — quality × time" in text
+
+    def test_instruction_tier_segment_rendering(self):
+        text = render_report(sample_report_data())
+        assert "Segments — instruction_confidence" in text
+
+    def test_instruction_generation_stats_rendering(self):
+        text = render_report(sample_report_data())
+        assert "Instruction generation: 3 generated · 1 fallback" in text
+
+    def test_bootstrap_seed_rendering(self):
+        text = render_report(sample_report_data())
+        assert "Bootstrap seed: 42" in text
 
     def test_low_sample_markers_and_warnings(self):
         text = render_report(sample_report_data())
@@ -223,7 +278,7 @@ class TestTerminalReport:
 
 
 class TestJsonReport:
-    def test_round_trip(self):
+    def test_json_round_trip(self):
         data = sample_report_data()
         parsed = ReportData.model_validate_json(render_json(data))
         assert parsed == data
@@ -233,6 +288,17 @@ class TestJsonReport:
         parsed = ReportData.model_validate_json(render_json(data))
         assert parsed.targets[0].wilson_lo is not None
         assert parsed.targets[0].wilson_hi is not None
+
+    def test_json_carries_pareto_and_generation_and_seed(self):
+        parsed = ReportData.model_validate_json(render_json(sample_report_data()))
+        assert parsed.pareto is not None
+        assert parsed.pareto.frontier == ["claude", "codex", "glm"]
+        assert parsed.pareto.axes == "quality-cost"
+        assert parsed.instruction_generation == InstructionGenerationStats(
+            generated=3, failed=1
+        )
+        assert parsed.bootstrap_seed == 42
+        assert "instruction_confidence" in parsed.segments
 
     def test_json_is_indented(self):
         assert "\n" in render_json(sample_report_data())

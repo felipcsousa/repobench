@@ -9,15 +9,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import shutil
 import statistics
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from repobench.analysis.metrics import aggregate_trials, segment_breakdown
+from repobench.analysis.metrics import TargetMetrics, aggregate_trials, segment_breakdown
+from repobench.analysis.pareto import pareto_frontier
 from repobench.analysis.recommendation import recommend
 from repobench.analysis.stats import paired_bootstrap
 from repobench.benchmark.coverage import CoverageReport, coverage_report
@@ -39,11 +40,13 @@ from repobench.core.types import (
     TaskStatus,
     TrialOutcome,
     TrialResult,
+    utcnow,
 )
 from repobench.execution.adapters.registry import get_adapter
 from repobench.execution.runner import TrialExecutor, run_matrix
 from repobench.execution.workspace import WorkspaceManager
 from repobench.mining.candidates import mine_candidates
+from repobench.mining.subsystem import detect_package_dirs, load_codeowners
 from repobench.repository.git import GitRepo
 from repobench.repository.github import GitHubClient
 from repobench.repository.workload import (
@@ -156,6 +159,8 @@ class AnalyzeOutcome:
     merged_prs: int
     enrichment: str  # "github" | "local"
     remote_slug: str | None
+    # None = unknown (no gh / no remote); True triggers the PRD §51 warning.
+    public_repository: bool | None = None
 
 
 def _local_enricher(repo: GitRepo) -> Callable[[PRInfo], PRInfo]:
@@ -175,6 +180,19 @@ def _local_enricher(repo: GitRepo) -> Callable[[PRInfo], PRInfo]:
     return enrich
 
 
+# One visibility probe per process: analyze and benchmark build share it (PRD §51).
+_REPO_VISIBILITY_CACHE: dict[str, str | None] = {}
+
+
+def repository_visibility(slug: str | None) -> str | None:
+    """PUBLIC | PRIVATE | None(unknown) via `gh repo view` — best-effort, cached."""
+    if not slug or not shutil.which("gh"):
+        return None
+    if slug not in _REPO_VISIBILITY_CACHE:
+        _REPO_VISIBILITY_CACHE[slug] = GitHubClient(slug).visibility()
+    return _REPO_VISIBILITY_CACHE[slug]
+
+
 def analyze_repository(root: Path, cfg: RepoBenchConfig) -> AnalyzeOutcome:
     """Mine the Workload Universe and eval candidates (PRD §10, §65-66)."""
     repo = GitRepo(root)
@@ -192,6 +210,8 @@ def analyze_repository(root: Path, cfg: RepoBenchConfig) -> AnalyzeOutcome:
         cfg.task_mining,
         enrich=enrich,
         lookback_days=cfg.repository.lookback_days,
+        codeowners=load_codeowners(root),
+        package_dirs=detect_package_dirs(root),
     )
     pool = [c for c in candidates if c.status is not TaskStatus.FILTERED]
     summary = summarize_analysis(
@@ -203,6 +223,7 @@ def analyze_repository(root: Path, cfg: RepoBenchConfig) -> AnalyzeOutcome:
         merged_prs=len(merged),
         enrichment=enrichment,
         remote_slug=slug,
+        public_repository=(repository_visibility(slug) == "PUBLIC") if slug else None,
     )
 
 
@@ -469,6 +490,7 @@ def build_benchmark(
         tasks=sample,
         universe_counts=universe_counts,
         lookback_days=cfg.repository.lookback_days,
+        public_repository=repository_visibility(repo.remote_slug) == "PUBLIC",
     )
 
     manifest = build_manifest(
@@ -556,6 +578,34 @@ def validate_targets(targets: list[ExecutionTarget]) -> None:
             )
 
 
+def check_custom_command_trust(
+    storage: Storage,
+    targets: list[ExecutionTarget],
+    *,
+    trusted: bool,
+) -> list[ExecutionTarget]:
+    """The PRD §26 gate for generic-command targets.
+
+    A command target may only execute when the user passed
+    --trust-custom-command, persisted execution.trust_custom_commands in
+    repobench.yml, or the exact same command template already ran before
+    (registered in execution_targets at first execution). Returns the command
+    targets that still need trust — empty when all are trusted.
+    """
+    gate_needs: list[ExecutionTarget] = []
+    for target in targets:
+        if target.harness != "command":
+            continue
+        registered = storage.get_target(target.id)
+        same_template = registered is not None and registered.get("command") == (
+            target.command or []
+        )
+        if trusted or same_template:
+            continue
+        gate_needs.append(target)
+    return gate_needs
+
+
 def resolve_benchmark(storage: Storage, benchmark_id: str | None) -> dict:
     if benchmark_id:
         row = storage.get_benchmark(benchmark_id)
@@ -599,6 +649,18 @@ class RunPlan:
     keep_workspaces: bool
     is_resume: bool
     already_complete: int
+    retried: int = 0
+
+
+# Outcomes a plain --resume retries: infrastructure/transient failures, never a
+# verdict. TIMEOUT is retryable because it may reflect machine contention, not
+# the target's ability (issue #10). --retry-failed additionally retries UNSOLVED.
+_RETRYABLE_OUTCOMES = (
+    TrialOutcome.SETUP_ERROR,
+    TrialOutcome.VERIFIER_ERROR,
+    TrialOutcome.HARNESS_ERROR,
+    TrialOutcome.TIMEOUT,
+)
 
 
 def plan_run(
@@ -609,6 +671,7 @@ def plan_run(
     targets: list[ExecutionTarget],
     benchmark_id: str | None = None,
     resume: bool = False,
+    retry_failed: bool = False,
     jobs: int | None = None,
     keep: bool | None = None,
 ) -> RunPlan:
@@ -638,16 +701,21 @@ def plan_run(
         for trial in storage.list_trials(run_id):
             existing[(trial.task_id, trial.target_id)] = trial
 
-    retryable = (TrialOutcome.SETUP_ERROR, TrialOutcome.VERIFIER_ERROR)
+    retryable = set(_RETRYABLE_OUTCOMES)
+    if retry_failed:
+        retryable.add(TrialOutcome.UNSOLVED)
     pairs: list[tuple[TaskPackage, ExecutionTarget]] = []
     already_complete = 0
+    retried = 0
     for task in tasks:
         for target in targets:
             previous = existing.get((task.task_id, target.id))
-            if previous is not None and previous.outcome not in retryable:
+            if previous is None or previous.outcome in retryable:
+                if previous is not None:
+                    retried += 1
+                pairs.append((task, target))
+            else:
                 already_complete += 1
-                continue
-            pairs.append((task, target))
 
     return RunPlan(
         run_id=run_id,
@@ -660,6 +728,7 @@ def plan_run(
         keep_workspaces=keep_eff,
         is_resume=is_resume,
         already_complete=already_complete,
+        retried=retried,
     )
 
 
@@ -678,6 +747,14 @@ def execute_plan(
     progress: Callable[[int, int, TrialResult], None] | None = None,
 ) -> RunOutcome:
     """Execute the planned matrix, persisting each trial (PRD §32, §96-99)."""
+    from repobench import __version__
+    from repobench.execution.fingerprint import (
+        build_run_manifest,
+        instruction_file_hashes,
+        target_fingerprint,
+    )
+    from repobench.execution.runner import cached_harness_version, harness_version_snapshot
+
     paths = project_paths(root)
     exec_cfg = cfg.execution.model_copy(
         update={"jobs": plan.jobs, "keep_workspaces": plan.keep_workspaces}
@@ -692,12 +769,14 @@ def execute_plan(
         on_result=storage.save_trial,
     )
 
+    bootstrap_seed = cfg.analysis.bootstrap_seed
     config_json = json.dumps(
         {
             "benchmark_id": plan.benchmark_id,
             "jobs": plan.jobs,
             "timeout_minutes": plan.timeout_minutes,
             "keep_workspaces": plan.keep_workspaces,
+            "bootstrap_seed": bootstrap_seed,
             "targets": [t.id for t in plan.targets],
         }
     )
@@ -709,6 +788,38 @@ def execute_plan(
         )
     else:
         storage.create_run(plan.run_id, plan.benchmark_id, config_json=config_json)
+
+    # Reproducibility record (PRD §29-31): register every target's fingerprint
+    # and write the run manifest next to the trials/ artifacts. The manifest is
+    # also the persisted trust anchor for generic-command templates (PRD §26).
+    for target in plan.targets:
+        fingerprint = target_fingerprint(target)
+        storage.save_target(
+            target.id,
+            definition_json=json.dumps(fingerprint["definition"]),
+            fingerprint_json=json.dumps(fingerprint),
+        )
+        # Probe harness versions now so the manifest (written before the matrix
+        # starts) already carries them; trial time reuses the same cache.
+        cached_harness_version(get_adapter(target.harness))
+    run_manifest = build_run_manifest(
+        run_id=plan.run_id,
+        benchmark_id=plan.benchmark_id,
+        targets=plan.targets,
+        harness_versions=harness_version_snapshot(),
+        instruction_hashes=instruction_file_hashes(root),
+        bootstrap_seed=bootstrap_seed,
+        started_at=utcnow().isoformat(),
+        repobench_version=__version__,
+    )
+    manifest_path = paths.run_dir(plan.run_id) / "manifest.json"
+    try:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(run_manifest, indent=2))
+    except OSError as exc:
+        logging.getLogger("repobench.cli").warning(
+            "run manifest write failed: %s", exc
+        )
 
     total = len(plan.pairs)
     done = 0
@@ -777,7 +888,11 @@ def build_report_data(
     root: Path, cfg: RepoBenchConfig, storage: Storage, *, run_id: str | None = None
 ):
     """Assemble ReportData for a run (PRD §104-112)."""
-    from repobench.reporting.models import PairComparison, ReportData
+    from repobench.reporting.models import (
+        InstructionGenerationStats,
+        PairComparison,
+        ReportData,
+    )
 
     if run_id:
         run_row = storage.get_run(run_id)
@@ -801,6 +916,15 @@ def build_report_data(
 
     metrics = aggregate_trials(trials)
 
+    run_config: dict = {}
+    if run_row.get("config_json"):
+        try:
+            run_config = json.loads(run_row["config_json"])
+        except Exception:
+            run_config = {}
+    bootstrap_seed = run_config.get("bootstrap_seed", cfg.analysis.bootstrap_seed)
+    concurrency = run_config.get("jobs")
+
     comparisons: list[PairComparison] = []
     comparison_maps: dict[tuple[str, str], dict] = {}
     best_id = _best_quality_target(metrics)
@@ -810,7 +934,7 @@ def build_report_data(
             if other == best_id:
                 continue
             trials_other = [t for t in trials if t.target_id == other]
-            boot = paired_bootstrap(trials_best, trials_other)
+            boot = paired_bootstrap(trials_best, trials_other, seed=bootstrap_seed)
             comparison_maps[(best_id, other)] = boot
             comparisons.append(
                 PairComparison(
@@ -824,11 +948,24 @@ def build_report_data(
             )
 
     recommendation = recommend(metrics, comparison_maps) if metrics else None
+    pareto = pareto_frontier(list(metrics.values())) if metrics else None
 
     segments = {
         dimension: segment_breakdown(trials, tasks, dimension)
-        for dimension in ("task_type", "subsystem", "complexity")
+        for dimension in ("task_type", "subsystem", "complexity", "instruction_confidence")
     }
+
+    # Tier-D generation outcome (issue #12): the generation/generation_failed
+    # extras written at build time are surfaced here instead of going unread.
+    instruction_generation = None
+    generated = sum(1 for task in tasks.values() if task.model_extra.get("generation"))
+    generation_failed = sum(
+        1 for task in tasks.values() if task.model_extra.get("generation_failed")
+    )
+    if generated or generation_failed:
+        instruction_generation = InstructionGenerationStats(
+            generated=generated, failed=generation_failed
+        )
 
     health: HealthReport | None = None
     if benchmark and benchmark.get("health_json"):
@@ -840,13 +977,20 @@ def build_report_data(
     warnings = list(health.warnings) if health else []
     if not any("network" in warning.lower() for warning in warnings):
         warnings.append("No network isolation")
-
-    concurrency = None
-    if run_row.get("config_json"):
-        try:
-            concurrency = json.loads(run_row["config_json"]).get("jobs")
-        except Exception:
-            concurrency = None
+    # PRD §30: results from different harness versions are not directly
+    # comparable — never silently mixed.
+    versions_by_target: dict[str, set[str]] = {}
+    for trial in trials:
+        if trial.harness_version:
+            versions_by_target.setdefault(trial.target_id, set()).add(
+                trial.harness_version
+            )
+    for target_id, versions in sorted(versions_by_target.items()):
+        if len(versions) > 1:
+            warnings.append(
+                f"target {target_id} ran with multiple harness versions "
+                f"({', '.join(sorted(versions))}) — its aggregated results mix configurations"
+            )
 
     # Single source of truth (PRD §89): the immutable manifest records the
     # repository the benchmark was built from. GitRepo is only a fallback for
@@ -873,7 +1017,168 @@ def build_report_data(
         targets=[metrics[tid] for tid in sorted(metrics)],
         comparisons=comparisons,
         recommendation=recommendation,
+        pareto=pareto,
         segments=segments,
+        instruction_generation=instruction_generation,
         warnings=warnings,
         concurrency=concurrency,
+        bootstrap_seed=bootstrap_seed,
     )
+
+
+# ----------------------------------------------------------------------- runs
+
+
+@dataclass
+class RunRowView:
+    """One row of `repobench runs` (issue #4)."""
+
+    run_id: str
+    benchmark_id: str | None
+    status: str
+    started_at: str | None
+    finished_at: str | None
+    targets: int
+    trials_done: int
+    trials_solved: int
+
+
+@dataclass
+class RunShowView:
+    """`repobench runs --show <id>`: run header + per-target summary."""
+
+    row: RunRowView
+    targets: list[TargetMetrics]
+
+
+def list_run_views(storage: Storage) -> list[RunRowView]:
+    """Every run with its per-target trial counts, newest first (issue #4)."""
+    counts = storage.trials_by_run()
+    views: list[RunRowView] = []
+    for row in storage.list_runs():
+        run_id = row["run_id"]
+        per_target = counts.get(run_id, {})
+        trials_done = sum(t["n"] for t in per_target.values())
+        trials_solved = sum(t["solved"] for t in per_target.values())
+        views.append(
+            RunRowView(
+                run_id=run_id,
+                benchmark_id=row.get("benchmark_id"),
+                status=row.get("status") or "—",
+                started_at=row.get("started_at"),
+                finished_at=row.get("finished_at"),
+                targets=len(per_target),
+                trials_done=trials_done,
+                trials_solved=trials_solved,
+            )
+        )
+    return views
+
+
+def show_run_view(storage: Storage, run_id: str) -> RunShowView:
+    """Per-target metrics for one run, or a polite error for an unknown id."""
+    row = storage.get_run(run_id)
+    if row is None:
+        known = ", ".join(r["run_id"] for r in storage.list_runs()[:5]) or "none"
+        raise UsageError(f"unknown run: {run_id} (recorded runs: {known})")
+    views = {view.run_id: view for view in list_run_views(storage)}
+    metrics = aggregate_trials(storage.list_trials(run_id))
+    return RunShowView(
+        row=views[run_id],
+        targets=[metrics[tid] for tid in sorted(metrics)],
+    )
+
+
+# -------------------------------------------------------------- trial export
+
+
+def load_trial_export(
+    root: Path, storage: Storage, *, run_id: str | None = None
+) -> tuple[list[TrialResult], dict[str, TaskMetadata]]:
+    """Trial rows + joined task metadata for `report --format jsonl|csv` (issue #5)."""
+    if run_id:
+        if storage.get_run(run_id) is None:
+            raise UsageError(f"unknown run: {run_id}")
+    else:
+        runs = storage.list_runs()
+        if not runs:
+            raise UsageError("no runs recorded — run `repobench run` first")
+        run_id = runs[0]["run_id"]
+
+    trials = storage.list_trials(run_id)
+    task_ids = sorted({t.task_id for t in trials})
+    tasks = load_task_metadata(ProjectPaths(root), storage, task_ids)
+    return trials, tasks
+
+
+# ---------------------------------------------------------------------- clean
+
+
+@dataclass
+class CleanPlan:
+    """What `repobench clean` would remove (dry-run by default, issue #9)."""
+
+    run_dirs: list[Path]
+    run_ids: list[str]  # DB rows (runs + trials) pruned with the dirs
+    workspace_dirs: list[Path]
+    cache_dir: Path | None
+    freed_bytes: int
+
+    @property
+    def empty(self) -> bool:
+        return not (self.run_dirs or self.workspace_dirs or self.cache_dir)
+
+
+def _dir_size(path: Path) -> int:
+    try:
+        return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+    except OSError:
+        return 0
+
+
+def plan_clean(
+    storage: Storage,
+    paths: ProjectPaths,
+    *,
+    keep_runs: int | None,
+    workspaces: bool,
+    cache: bool,
+) -> CleanPlan:
+    """Compute the GC plan: runs beyond the newest `keep_runs` (None = leave runs
+    alone), leftover trial workspaces and the legacy cache dir. Nothing is deleted."""
+    run_dirs: list[Path] = []
+    run_ids: list[str] = []
+    if keep_runs is not None:
+        for row in storage.list_runs()[keep_runs:]:  # newest first
+            run_id = row["run_id"]
+            run_ids.append(run_id)
+            run_dir = paths.run_dir(run_id)
+            if run_dir.is_dir():
+                run_dirs.append(run_dir)
+
+    workspace_dirs = (
+        sorted(p for p in paths.workspaces_dir.iterdir() if p.is_dir())
+        if workspaces and paths.workspaces_dir.is_dir()
+        else []
+    )
+    cache_dir = paths.cache_dir if cache and paths.cache_dir.is_dir() else None
+
+    freed = sum(_dir_size(d) for d in [*run_dirs, *workspace_dirs, *([cache_dir] if cache_dir else [])])
+    return CleanPlan(
+        run_dirs=run_dirs,
+        run_ids=run_ids,
+        workspace_dirs=workspace_dirs,
+        cache_dir=cache_dir,
+        freed_bytes=freed,
+    )
+
+
+def apply_clean(storage: Storage, plan: CleanPlan) -> None:
+    """Execute a computed CleanPlan: rmtree artifacts, prune runs + trials rows."""
+    for directory in [*plan.workspace_dirs, *plan.run_dirs]:
+        shutil.rmtree(directory, ignore_errors=True)
+    if plan.cache_dir is not None:
+        shutil.rmtree(plan.cache_dir, ignore_errors=True)
+    for run_id in plan.run_ids:
+        storage.execute("DELETE FROM trials WHERE run_id = ?", (run_id,))
+        storage.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
