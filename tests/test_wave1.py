@@ -194,6 +194,17 @@ def _sample_trials() -> tuple[list[TrialResult], dict[str, TaskMetadata]]:
 
 
 class TestTrialExport:
+    def test_export_row_covers_csv_columns_exactly(self) -> None:
+        # Drift guard: the explicit row builder and the CSV header are one contract.
+        from repobench.reporting.export import _export_row
+
+        trials, tasks = _sample_trials()
+        assert set(_export_row(trials[0], tasks["task_1"])) == set(CSV_COLUMNS)
+        # a trial without task metadata leaves the task.* columns absent, not wrong
+        assert set(_export_row(trials[0], None)) == set(CSV_COLUMNS) - {
+            c for c in CSV_COLUMNS if c.startswith("task.")
+        }
+
     def test_jsonl_round_trips_to_trial_result(self) -> None:
         trials, tasks = _sample_trials()
         lines = render_jsonl(trials, tasks).splitlines()
@@ -395,15 +406,6 @@ class TestHarnessVersionCache:
         assert runner_module.cached_harness_version(adapter) == "1.2.3"
         assert calls["n"] == 1  # second lookup served from the cache
 
-    def test_runner_records_harness_version_on_results(
-        self, fixture_repo: Path, fake_agent_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        storage = _fast_forward(fixture_repo, fake_agent_path, monkeypatch)
-        assert _invoke("run", "fixer", "--yes", "--trust-custom-command").exit_code == 0
-        trial = storage.list_trials(storage.list_runs()[0]["run_id"])[0]
-        # The command harness has no binary to probe — None, never invented.
-        assert "harness_version" in TrialResult.model_fields
-
 
 # --------------------------------------------------------------- #7 trust gate
 
@@ -562,6 +564,33 @@ class TestSeedAndConfigCleanup:
 
 
 # ------------------------------------------------------- #4 runs / #9 clean
+
+
+class TestCleanScope:
+    def test_flag_combinations(self) -> None:
+        from repobench.cli.maintenance import CleanScope
+
+        # plain `clean`: conservative default, prune beyond the newest run
+        assert CleanScope.from_flags() == CleanScope(keep_runs=1, workspaces=False, cache=False)
+        # --runs N
+        assert CleanScope.from_flags(3).keep_runs == 3
+        # scoped cleans never touch runs implicitly
+        assert CleanScope.from_flags(workspaces=True) == CleanScope(
+            keep_runs=None, workspaces=True, cache=False
+        )
+        assert CleanScope.from_flags(cache=True).keep_runs is None
+        # --all covers everything and drops every run unless narrowed
+        assert CleanScope.from_flags(all_scope=True) == CleanScope(
+            keep_runs=0, workspaces=True, cache=True
+        )
+        assert CleanScope.from_flags(2, all_scope=True).keep_runs == 2
+
+    def test_negative_runs_rejected(self) -> None:
+        from repobench.cli.maintenance import CleanScope
+        from repobench.core.errors import UsageError
+
+        with pytest.raises(UsageError):
+            CleanScope.from_flags(-1)
 
 
 class TestRunsAndClean:

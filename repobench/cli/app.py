@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -426,7 +425,7 @@ def run(
     """Execute Benchmark × Targets locally (PRD §96-99)."""
     from repobench.cli import render
     from repobench.cli.services import (
-        check_custom_command_trust,
+        ensure_custom_command_trust,
         execute_plan,
         plan_run,
         resolve_targets,
@@ -444,22 +443,11 @@ def run(
         validate_targets(targets)
         # Trust gate (PRD §26): generic commands execute only with the flag,
         # persisted config trust, or an identical previously-run template.
-        untrusted = check_custom_command_trust(
+        ensure_custom_command_trust(
             storage,
             targets,
             trusted=trust_custom_command or cfg.execution.trust_custom_commands,
         )
-        if untrusted:
-            render.echo(
-                "custom command targets are not trusted yet — review before first execution:"
-            )
-            for target in untrusted:
-                render.echo(f"  {target.id}: {shlex.join(target.command or [])}")
-            _fail(
-                "re-run with --trust-custom-command or set "
-                "execution.trust_custom_commands: true in repobench.yml (PRD §26)"
-            )
-            return
         plan = plan_run(
             storage,
             paths,
@@ -510,7 +498,7 @@ def report(
 ) -> None:
     """Show the comparison report for a run (PRD §111-112)."""
     from repobench.cli import render
-    from repobench.cli.services import build_report_data, load_trial_export
+    from repobench.cli.reports import build_report_data, load_trial_export
     from repobench.core.errors import RepoBenchError
     from repobench.reporting.export import render_csv, render_jsonl
     from repobench.reporting.json_report import render_json
@@ -553,11 +541,11 @@ def runs(
 ) -> None:
     """List recorded runs, or inspect one with --show <id> (issue #4)."""
     from repobench.cli import render
-    from repobench.cli.services import list_run_views, show_run_view
+    from repobench.cli.maintenance import list_run_views, show_run_view
     from repobench.core.errors import RepoBenchError
 
     try:
-        root, _paths, _cfg, storage = _service_context(ctx)
+        _root, _paths, _cfg, storage = _service_context(ctx)
         if show:
             view = show_run_view(storage, show)
             render.render_run_show(view)
@@ -597,29 +585,15 @@ def clean(
 ) -> None:
     """Garbage-collect .repobench/ artifacts (dry-run by default, issue #9)."""
     from repobench.cli import render
-    from repobench.cli.services import apply_clean, plan_clean
+    from repobench.cli.maintenance import CleanScope, apply_clean, plan_clean
     from repobench.core.errors import RepoBenchError
 
-    if all_scope:
-        workspaces = True
-        cache = True
-        if runs_to_keep is None:
-            runs_to_keep = 0  # --all drops every run unless --runs narrows it
-    if runs_to_keep is not None:
-        keep_runs: int | None = runs_to_keep
-    elif workspaces or cache:
-        keep_runs = None  # a scoped clean never touches runs implicitly
-    else:
-        keep_runs = 1  # plain `clean`: conservative preview, prune beyond the newest run
-    if keep_runs is not None and keep_runs < 0:
-        _fail("--runs must be >= 0")
-        return
-
     try:
-        root, paths, _cfg, storage = _service_context(ctx)
-        plan = plan_clean(
-            storage, paths, keep_runs=keep_runs, workspaces=workspaces, cache=cache
+        _root, paths, _cfg, storage = _service_context(ctx)
+        scope = CleanScope.from_flags(
+            runs_to_keep, workspaces=workspaces, cache=cache, all_scope=all_scope
         )
+        plan = plan_clean(storage, paths, scope)
     except RepoBenchError as exc:
         _fail(str(exc))
         return

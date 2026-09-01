@@ -38,7 +38,7 @@ from repobench.core.types import (
 from repobench.execution.adapters.base import HarnessAdapter
 from repobench.execution.adapters.registry import get_adapter
 from repobench.execution.environment import TrialEnvironment
-from repobench.execution.process import run_process
+from repobench.execution.process import MAX_OUTPUT_BYTES, run_process
 from repobench.execution.usage import resolve_cost
 from repobench.execution.workspace import (
     Workspace,
@@ -54,7 +54,6 @@ _LOG = logging.getLogger("repobench.execution.runner")
 _INSTALL_TIMEOUT_SECONDS = 1800
 _VERIFIER_TIMEOUT_SECONDS = 1800
 _ERROR_TAIL_CHARS = 1500
-_ARTIFACT_OUTPUT_CAP_BYTES = 2 * 1024 * 1024
 
 # Harness version probed once per process (PRD §29): the same adapter would
 # otherwise re-run `--version` for every trial of the same run.
@@ -78,11 +77,15 @@ def harness_version_snapshot() -> dict[str, str | None]:
 
 
 def _write_output_artifact(path: Path, text: str) -> None:
-    """Best-effort capped write (PRD §121): output artifacts must never break a trial."""
+    """Best-effort capped write (PRD §121): output artifacts must never break a trial.
+
+    The cap mirrors process.py's capture cap (MAX_OUTPUT_BYTES, tail kept) so a
+    future raise of one constant covers capture and artifacts together.
+    """
     try:
         data = text.encode("utf-8", errors="replace")
-        if len(data) > _ARTIFACT_OUTPUT_CAP_BYTES:
-            data = data[-_ARTIFACT_OUTPUT_CAP_BYTES:]
+        if len(data) > MAX_OUTPUT_BYTES:
+            data = data[-MAX_OUTPUT_BYTES:]
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
     except OSError as exc:

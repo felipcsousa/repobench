@@ -15,8 +15,8 @@ from typing import Any
 
 from repobench.core.types import TaskMetadata, TrialResult
 
-# Flat CSV column contract: dotted paths inside one TrialResult document,
-# plus the task-metadata join (prefixed task.*).
+# Flat CSV column contract; keys of _export_row() must match exactly (guarded
+# by test_export_row_covers_csv_columns).
 CSV_COLUMNS: tuple[str, ...] = (
     "trial_id",
     "run_id",
@@ -54,27 +54,64 @@ CSV_COLUMNS: tuple[str, ...] = (
 )
 
 
-def _dig(document: dict, dotted_path: str) -> Any:
-    value: Any = document
-    for part in dotted_path.split("."):
-        if not isinstance(value, dict):
-            return None
-        value = value.get(part)
-    return value
-
-
-def _join_task(trial: TrialResult, tasks: dict[str, TaskMetadata]) -> dict:
-    task = tasks.get(trial.task_id)
-    if task is None:
-        return {}
-    assessment = task.assessment
+def _task_fields(task: TaskMetadata) -> dict[str, Any]:
+    """The task-metadata join shared by both export formats (issue #5)."""
     return {
-        "task.pr_number": task.pr_number,
-        "task.task_type": assessment.task_type.value,
-        "task.subsystem": assessment.subsystem,
-        "task.complexity": assessment.complexity.value,
-        "task.instruction_confidence": assessment.instruction_confidence,
+        "pr_number": task.pr_number,
+        "task_type": task.assessment.task_type.value,
+        "subsystem": task.assessment.subsystem,
+        "complexity": task.assessment.complexity.value,
+        "instruction_confidence": task.assessment.instruction_confidence,
     }
+
+
+def _export_row(trial: TrialResult, task: TaskMetadata | None) -> dict[str, Any]:
+    """One trial as {CSV column: value} — explicit, no generic path walking."""
+    usage = trial.usage
+    row: dict[str, Any] = {
+        "trial_id": trial.trial_id,
+        "run_id": trial.run_id,
+        "benchmark_id": trial.benchmark_id,
+        "task_id": trial.task_id,
+        "target_id": trial.target_id,
+        "harness": trial.harness,
+        "harness_version": trial.harness_version,
+        "model": trial.model,
+        "provider": trial.provider,
+        "outcome": trial.outcome.value,
+        "started_at": trial.started_at.isoformat() if trial.started_at else None,
+        "duration_ms": trial.duration_ms,
+        "exit_code": trial.exit_code,
+        "timed_out": trial.timed_out,
+        "task_verified": trial.task_verified,
+        "regression_verified": trial.regression_verified,
+        "usage.input_tokens": usage.input_tokens if usage else None,
+        "usage.cached_input_tokens": usage.cached_input_tokens if usage else None,
+        "usage.output_tokens": usage.output_tokens if usage else None,
+        "usage.reasoning_tokens": usage.reasoning_tokens if usage else None,
+        "usage.requests": usage.requests if usage else None,
+        "usage.tool_calls": usage.tool_calls if usage else None,
+        "usage.reported_cost_usd": usage.reported_cost_usd if usage else None,
+        "cost_usd": trial.cost_usd,
+        "cost_source": trial.cost_source,
+        "files_changed": trial.files_changed,
+        "loc_added": trial.loc_added,
+        "loc_removed": trial.loc_removed,
+    }
+    if task is not None:
+        row.update({f"task.{key}": value for key, value in _task_fields(task).items()})
+    return row
+
+
+def _csv_value(value: Any) -> Any:
+    """None → empty cell; bools in lowercase json style; everything else as-is."""
+    if value is None:
+        return ""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return value
 
 
 def render_jsonl(
@@ -87,13 +124,7 @@ def render_jsonl(
         document = json.loads(trial.model_dump_json())
         task = tasks.get(trial.task_id)
         if task is not None:
-            document["task"] = {
-                "pr_number": task.pr_number,
-                "task_type": task.assessment.task_type.value,
-                "subsystem": task.assessment.subsystem,
-                "complexity": task.assessment.complexity.value,
-                "instruction_confidence": task.assessment.instruction_confidence,
-            }
+            document["task"] = _task_fields(task)
         lines.append(json.dumps(document, sort_keys=False))
     return "\n".join(lines) + ("\n" if lines else "")
 
@@ -107,11 +138,6 @@ def render_csv(
     writer = csv.writer(buffer, lineterminator="\n")
     writer.writerow(CSV_COLUMNS)
     for trial in trials:
-        document = json.loads(trial.model_dump_json())
-        row = {**_join_task(trial, tasks)}
-        for column in CSV_COLUMNS:
-            if column not in row:
-                value = _dig(document, column)
-                row[column] = "" if value is None else value
-        writer.writerow([row[column] for column in CSV_COLUMNS])
+        row = _export_row(trial, tasks.get(trial.task_id))
+        writer.writerow([_csv_value(row.get(column)) for column in CSV_COLUMNS])
     return buffer.getvalue()
