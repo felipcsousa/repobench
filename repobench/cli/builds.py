@@ -56,6 +56,12 @@ from repobench.tasks.generation import generate_instruction
 from repobench.tasks.instruction import render_instruction
 from repobench.tasks.leakage import LeakageReport, scan_base_archive
 from repobench.tasks.reconstruction import build_task_package
+from repobench.validation.brittle import (
+    BRITTLE_FINDINGS_CAP,
+    brittle_assertions,
+    brittle_file_warnings,
+)
+from repobench.validation.flakiness import flakiness_from_history
 from repobench.validation.pipeline import (
     LEAKAGE_SCORE_THRESHOLD,
     TaskValidator,
@@ -111,6 +117,27 @@ class BenchmarkBuildOutcome:
 
 def _package_for(repo: GitRepo, candidate: CandidateInfo, paths: ProjectPaths) -> TaskPackage:
     return build_task_package(repo.root, candidate, paths.task_dir(task_id_for(candidate)))
+
+
+def _brittle_findings(verifier_diffs: list[str]) -> list[str]:
+    """Brittle-assertion findings across this build's verifier diffs, capped
+    (issue #19): the linter only points at files, so a bounded sample of
+    findings is enough — never a score input."""
+    findings: list[str] = []
+    for diff in verifier_diffs:
+        findings.extend(brittle_assertions(diff))
+        if len(findings) >= BRITTLE_FINDINGS_CAP:
+            break
+    return findings[:BRITTLE_FINDINGS_CAP]
+
+
+def _verifier_diff_text(package: TaskPackage) -> str:
+    """The verifier patch text, or "" when unreadable — a missing diff is no
+    finding, never an error (heuristic input only)."""
+    try:
+        return package.verifier_patch.read_text()
+    except OSError:
+        return ""
 
 
 def _resolve_generation_target(cfg: RepoBenchConfig) -> ExecutionTarget | None:
@@ -343,6 +370,19 @@ def build_benchmark(
         key = candidate.assessment.task_type.value
         universe_counts[key] = universe_counts.get(key, 0) + 1
 
+    # Verifier strength (issue #19): flakiness comes from the append-only
+    # validation history via Storage's single reader, scoped to the tasks this
+    # build actually validated; brittle assertions are scanned from the
+    # sampled tasks' verifier patches and only ever warn, never score.
+    build_task_ids = {r.package.task_id for r in results}
+    history = [
+        row for row in storage.validation_history() if row["task_id"] in build_task_ids
+    ]
+    flakiness = flakiness_from_history(history)
+    brittle_warnings = brittle_file_warnings(
+        _brittle_findings([_verifier_diff_text(r.package) for r in sampled_valid])
+    )
+
     health = compute_health(
         coverage=coverage,
         all_checks_passed_ratio=passed_ratio,
@@ -351,7 +391,19 @@ def build_benchmark(
         universe_counts=universe_counts,
         lookback_days=cfg.repository.lookback_days,
         public_repository=repository_visibility(repo.remote_slug) == "PUBLIC",
+        flaky_tasks=flakiness.flaky_tasks,
+        total_validated_tasks=flakiness.tasks_seen,
+        brittle_warnings=brittle_warnings,
     )
+    if log is not None:
+        # One line each (issue #19): the full detail travels in health.warnings.
+        if flakiness.flaky_tasks:
+            log(
+                f"{len(flakiness.flaky_tasks)} task(s) with flaky validation "
+                "history (outcome flipped between builds)"
+            )
+        for warning in brittle_warnings:
+            log(warning)
 
     manifest = build_manifest(
         sample,

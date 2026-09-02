@@ -135,7 +135,8 @@ class TestCoverage:
 
 class TestHealth:
     def test_overall_known_inputs(self):
-        # 40/25/15/10/10 -> round(32 + 22.5 + 10.5 + 5 + 10) = 80.
+        # 40/15/10/15/10/10 (issue #19 rebalance; verifier_strength 100 with no
+        # history) -> round(32 + 13.5 + 10 + 10.5 + 5 + 10) = 81.
         coverage = CoverageReport(task_type=80, subsystem=80, complexity=80, overall=80)
         tasks = [
             make_task("a", subsystem="core", task_type=TaskType.BUGFIX, created_at=NOW - timedelta(days=90)),
@@ -151,10 +152,11 @@ class TestHealth:
         )
         assert health.representativeness == 80
         assert health.validation_confidence == 90
+        assert health.verifier_strength == 100
         assert health.leakage_resistance == 70
         assert health.recency == 50  # median age 90 of lookback 180
         assert health.diversity == 100  # 2/2 subsystems, 2/2 types
-        assert health.overall == 80
+        assert health.overall == 81
 
     def test_network_warning_always_present(self):
         coverage = CoverageReport(task_type=100, subsystem=100, complexity=100, overall=100)

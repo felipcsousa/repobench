@@ -201,8 +201,9 @@ def test_workspace_lifecycle(base_repo: Path, tmp_path: Path) -> None:
     _git(ws.repo_dir, "add", "-A")
     _git(ws.repo_dir, "commit", "--quiet", "-m", "agent fix")
     patch = ws.base_dir / "agent.patch"
-    files, added, removed = capture_agent_patch(ws.repo_dir, patch)
+    files, added, removed, tampered = capture_agent_patch(ws.repo_dir, patch)
     assert files == 1 and added >= 1 and removed >= 1
+    assert tampered == []  # impl-only change — no tampering (issue #18)
     assert "x % 2 == 0" in patch.read_text()
 
     # verification snapshot keeps the original tree untouched

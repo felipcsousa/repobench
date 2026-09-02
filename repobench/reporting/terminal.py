@@ -31,6 +31,15 @@ def _format_money(value: float | None) -> str:
     return f"${value:.2f}" if value is not None else "—"
 
 
+def _format_cost_cell(metrics) -> str:  # noqa: ANN001 - TargetMetrics
+    """$/solve cell; `~` marks a catalog-estimated cost (issue #17) so an
+    estimate is never rendered as a hard number."""
+    if metrics.cost_per_solve_usd is None:
+        return "—"
+    marker = "~" if metrics.cost_source == "CATALOG_ESTIMATE" else ""
+    return f"{marker}${metrics.cost_per_solve_usd:.2f}"
+
+
 def _format_pp(value: float) -> str:
     return f"{value:+.0f}pp"
 
@@ -126,8 +135,11 @@ def render_report(data: ReportData) -> str:
             f"{metrics.target_id:<24}"
             f"{metrics.solve_rate * 100:>7.0f}%"
             f"{_format_duration(metrics.time_p50_ms):>10}"
-            f"{_format_money(metrics.cost_per_solve_usd):>10}"
+            f"{_format_cost_cell(metrics):>10}"
         )
+    if any(m.cost_source == "CATALOG_ESTIMATE" for m in data.targets):
+        lines.append("")
+        lines.append("~ cost estimated from the bundled pricing catalog (edit pricing: in repobench.yml to override)")
 
     if data.targets:
         lines.append("")
@@ -157,6 +169,20 @@ def render_report(data: ReportData) -> str:
                 f"var {stats.per_task_variance:.2f} · "
                 f"$/reliable solve {_format_money(stats.cost_per_reliable_solve_usd)}"
             )
+
+    if data.test_tampering is not None:
+        # issue #18: reward-hacking signal, surfaced without touching verdicts.
+        tamper = data.test_tampering
+        lines.append("")
+        lines.append("Reward hacking — test tampering")
+        lines.append("")
+        for target_id in sorted(tamper.trials_by_target):
+            flagged = tamper.by_target.get(target_id, 0)
+            row = f"  {target_id:<10}{flagged}/{tamper.trials_by_target[target_id]}"
+            if flagged:
+                paths = tamper.paths_by_target.get(target_id, [])
+                row += f" trial(s) touched tests ({', '.join(paths)})"
+            lines.append(row)
 
     for comparison in data.comparisons:
         lines.append("")

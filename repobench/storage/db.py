@@ -214,6 +214,22 @@ class Storage:
             (task_id, kind, result, details_json, utcnow().isoformat()),
         )
 
+    def validation_history(self, task_id: str | None = None) -> list[dict[str, Any]]:
+        """Validation log rows in insertion order — the single reader for
+        task_validations (issue #19). Ordered by (created_at, id): id (an alias
+        of the sqlite rowid) breaks ties between rows sharing a timestamp, so
+        the append sequence is reconstructed exactly. `result` is check-level:
+        "passed", "failed" or "skipped" (None = inconclusive check)."""
+        sql = (
+            "SELECT task_id, kind, result, details_json, created_at "
+            "FROM task_validations ORDER BY created_at, id"
+        )
+        params: tuple = ()
+        if task_id is not None:
+            sql = sql.replace(" ORDER BY", " WHERE task_id = ? ORDER BY")
+            params = (task_id,)
+        return self.query(sql, params)
+
     # -- benchmarks --
 
     def save_benchmark(

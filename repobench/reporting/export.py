@@ -47,6 +47,7 @@ CSV_COLUMNS: tuple[str, ...] = (
     "files_changed",
     "loc_added",
     "loc_removed",
+    "tampered_tests",
     "task.pr_number",
     "task.task_type",
     "task.subsystem",
@@ -99,6 +100,9 @@ def _export_row(trial: TrialResult, task: TaskMetadata | None) -> dict[str, Any]
         "files_changed": trial.files_changed,
         "loc_added": trial.loc_added,
         "loc_removed": trial.loc_removed,
+        # issue #18: test files the agent's diff touched, `;`-joined (a finding,
+        # independent of the outcome columns)
+        "tampered_tests": ";".join(trial.tampered_tests),
     }
     if task is not None:
         row.update({f"task.{key}": value for key, value in _task_fields(task).items()})
