@@ -442,7 +442,7 @@ AgentFit analyzed your repository
 
 Merged PRs                   1,842
 Potential task candidates      187
-Validated eval candidates       43
+Candidates passing hard filters  43
 
 Workload
 

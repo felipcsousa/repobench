@@ -39,7 +39,7 @@ from repobench.cli.services import (
     validate_targets,
 )
 from repobench.config import RepoBenchConfig
-from repobench.core.errors import UsageError
+from repobench.core.errors import ReconstructionError, UsageError
 from repobench.core.types import (
     CandidateInfo,
     ExecutionTarget,
@@ -113,6 +113,9 @@ class BenchmarkBuildOutcome:
     # --force-revalidate wins), reused counts tasks that skipped revalidation.
     reuse_valid: bool = False
     reused: int = 0
+    # Issue #33: candidates whose history could not be reconstructed at all —
+    # persisted REJECTED, but never in results (a TaskBuildResult needs a package).
+    reconstruction_rejected: list[CandidateInfo] = field(default_factory=list)
 
 
 def _package_for(repo: GitRepo, candidate: CandidateInfo, paths: ProjectPaths) -> TaskPackage:
@@ -293,8 +296,29 @@ def build_benchmark(
     reusable = reusable_task_ids(storage, paths) if reuse_valid else set()
     reused_count = 0
     results: list[TaskBuildResult] = []
+    reconstruction_rejected: list[CandidateInfo] = []
     for candidate in pool:
-        package = _package_for(repo, candidate, paths)
+        try:
+            package = _package_for(repo, candidate, paths)
+        except ReconstructionError as exc:
+            # Issue #33: one unreconstructable history (e.g. a PR based on the
+            # empty-tree initial commit) rejects only itself — the build continues
+            # with the remaining candidates. No package exists yet, so unlike
+            # `_persist_validation` only the candidate row is persisted.
+            rejected = candidate.model_copy(
+                update={
+                    "status": TaskStatus.REJECTED,
+                    "rejection_code": RejectionCode.HISTORY_UNSUPPORTED,
+                }
+            )
+            storage.save_candidate(rejected)
+            reconstruction_rejected.append(rejected)
+            if log is not None:
+                log(
+                    f"PR #{candidate.pr.number}: REJECTED (HISTORY_UNSUPPORTED) — "
+                    f"{exc}"
+                )
+            continue
         if generation_target is not None:
             candidate = _apply_instruction_generation(
                 repo,
@@ -338,13 +362,22 @@ def build_benchmark(
 
     valid = [r for r in results if r.status is TaskStatus.VALID]
     if not valid:
-        codes = ", ".join(
-            sorted({r.rejection_code.value for r in results if r.rejection_code})
+        codes = sorted(
+            {
+                *(r.rejection_code.value for r in results if r.rejection_code),
+                *(
+                    c.rejection_code.value
+                    for c in reconstruction_rejected
+                    if c.rejection_code
+                ),
+            }
         )
         raise UsageError(
             "no valid tasks were produced — nothing to benchmark. "
-            f"Rejection codes: {codes or 'unknown'}. "
-            "Check project.test_command in repobench.yml and `repobench candidates`."
+            f"Rejection codes: {', '.join(codes) or 'unknown'}. "
+            "Check project.test_command in repobench.yml and `repobench candidates`; "
+            "`repobench candidates --show <PR>` prints each task's validation "
+            "checks with output tails (issue #35)."
         )
 
     requested = size if size is not None else cfg.benchmark.size
@@ -447,6 +480,7 @@ def build_benchmark(
         instruction_tiers=instruction_tiers,
         reuse_valid=reuse_valid,
         reused=reused_count,
+        reconstruction_rejected=reconstruction_rejected,
     )
 
 

@@ -16,7 +16,8 @@ import json
 import logging
 import shlex
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable
@@ -41,7 +42,7 @@ from repobench.execution.runner import TrialExecutor, run_matrix
 from repobench.execution.workspace import WorkspaceManager
 from repobench.mining.candidates import mine_candidates
 from repobench.mining.subsystem import detect_package_dirs, load_codeowners
-from repobench.repository.git import GitRepo
+from repobench.repository.git import GitRepo, MergeStyleCounts
 from repobench.repository.github import GitHubClient
 from repobench.repository.workload import suggest_benchmark_size, summarize_analysis
 from repobench.storage.db import Storage
@@ -146,6 +147,11 @@ class AnalyzeOutcome:
     remote_slug: str | None
     # None = unknown (no gh / no remote); True triggers the PRD §51 warning.
     public_repository: bool | None = None
+    # Issue #31: how the window's PRs were merged, and the gh ground-truth count
+    # they are recall-checked against. recall_total None = unavailable (no gh /
+    # no slug) — the renderers show no recall rather than inventing one.
+    merge_styles: MergeStyleCounts = field(default_factory=MergeStyleCounts)
+    recall_total: int | None = None
 
 
 def _local_enricher(repo: GitRepo) -> Callable[[PRInfo], PRInfo]:
@@ -185,12 +191,17 @@ def analyze_repository(root: Path, cfg: RepoBenchConfig) -> AnalyzeOutcome:
     else:
         enrich = _local_enricher(repo)
         enrichment = "local"
-    merged = repo.merged_prs(cfg.repository.lookback_days)
+    # One clock for every window computation: mining, style counts and the gh
+    # recall denominator must all cover the same lookback window (issue #31).
+    now = datetime.now(timezone.utc)
+    lookback = cfg.repository.lookback_days
+    merged = repo.merged_prs(lookback, now=now)
+    merge_styles = repo.merge_style_counts(lookback, now=now)
     candidates = mine_candidates(
         repo,
         cfg.task_mining,
         enrich=enrich,
-        lookback_days=cfg.repository.lookback_days,
+        lookback_days=lookback,
         codeowners=load_codeowners(root),
         package_dirs=detect_package_dirs(root),
     )
@@ -198,6 +209,12 @@ def analyze_repository(root: Path, cfg: RepoBenchConfig) -> AnalyzeOutcome:
     summary = summarize_analysis(
         len(merged), candidates, suggest_benchmark_size(len(pool))
     )
+    # gh ground truth only exists when enrichment does; `since` mirrors the git
+    # layer's window (_window_since): same clock, microseconds dropped.
+    recall_total = None
+    if enrichment == "github" and slug is not None:
+        since = (now - timedelta(days=lookback)).replace(microsecond=0)
+        recall_total = GitHubClient(slug).merged_pr_count(since)
     return AnalyzeOutcome(
         summary=summary,
         candidates=candidates,
@@ -205,6 +222,8 @@ def analyze_repository(root: Path, cfg: RepoBenchConfig) -> AnalyzeOutcome:
         enrichment=enrichment,
         remote_slug=slug,
         public_repository=(repository_visibility(slug) == "PUBLIC") if slug else None,
+        merge_styles=merge_styles,
+        recall_total=recall_total,
     )
 
 

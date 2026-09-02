@@ -13,6 +13,11 @@ For each Task x ExecutionTarget the executor runs the 13-step pipeline:
 Correctness is defined exclusively by the hidden verifiers — the harness exit
 code is recorded but never defines the outcome (PRD §42, §63). execute() never
 raises: unexpected failures surface as SETUP_ERROR/VERIFIER_ERROR results.
+
+Install and verifier commands run in `project.cwd` when configured (issue #34,
+monorepos); the harness itself always runs at the workspace root so the agent
+sees the whole repo. A workspace missing project.cwd is a config problem
+surfaced as SETUP_ERROR/VERIFIER_ERROR with a clear message — never a crash.
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from repobench.config import ExecutionConfig, PricingRule, ProjectConfig
+from repobench.config import ExecutionConfig, PricingRule, ProjectConfig, compose_cwd
 from repobench.core.ids import new_trial_id
 from repobench.core.types import (
     CommandSpec,
@@ -382,8 +387,18 @@ class TrialExecutor:
             argv = shlex.split(self.project_cfg.install_command or "")
         except ValueError as exc:
             return f"invalid install_command: {exc}"
+        # Issue #34: install runs in project.cwd when set; the harness below
+        # still gets the repo root. cwd is validated relative at config load,
+        # but a workspace may not contain the directory — a config problem,
+        # reported with a clear message instead of a mystery spawn failure.
+        run_dir = compose_cwd(ws.repo_dir, self.project_cfg)
+        if not run_dir.is_dir():
+            return (
+                f"project.cwd {self.project_cfg.cwd!r} does not exist in the workspace "
+                f"({ws.repo_dir}) — fix project.cwd in repobench.yml"
+            )
         result = await run_process(
-            CommandSpec(argv=argv, cwd=ws.repo_dir, timeout_seconds=_INSTALL_TIMEOUT_SECONDS)
+            CommandSpec(argv=argv, cwd=run_dir, timeout_seconds=_INSTALL_TIMEOUT_SECONDS)
         )
         if result.exit_code == 0:
             return None
@@ -412,7 +427,20 @@ class TrialExecutor:
                 "no test_command configured (set project.test_command in repobench.yml)",
             )
 
-        task_verified = await self._run_verifier(self.project_cfg.test_command, verify_ws)
+        # Issue #34: verifiers run in project.cwd inside the snapshot copy; the
+        # agent-visible workspace root is untouched. Missing there is a config
+        # problem → VERIFIER_ERROR with a clear message, never a crash.
+        verify_dir = compose_cwd(verify_ws, self.project_cfg)
+        if not verify_dir.is_dir():
+            return (
+                TrialOutcome.VERIFIER_ERROR,
+                None,
+                None,
+                f"project.cwd {self.project_cfg.cwd!r} does not exist in the verification "
+                f"workspace ({verify_ws}) — fix project.cwd in repobench.yml",
+            )
+
+        task_verified = await self._run_verifier(self.project_cfg.test_command, verify_dir)
         if isinstance(task_verified, str):
             return TrialOutcome.VERIFIER_ERROR, None, None, task_verified
         if task_verified is False:
@@ -420,7 +448,7 @@ class TrialExecutor:
             return TrialOutcome.UNSOLVED, False, None, None
 
         regression_command = self.project_cfg.regression_command or self.project_cfg.test_command
-        regression_verified = await self._run_verifier(regression_command, verify_ws)
+        regression_verified = await self._run_verifier(regression_command, verify_dir)
         if isinstance(regression_verified, str):
             return TrialOutcome.VERIFIER_ERROR, True, None, regression_verified
 
@@ -428,14 +456,16 @@ class TrialExecutor:
             return TrialOutcome.SOLVED, True, True, None
         return TrialOutcome.UNSOLVED, task_verified, regression_verified, None
 
-    async def _run_verifier(self, command: str, verify_ws: Path) -> bool | str:
-        """True=pass, False=fail (exit 1), str=verifier crashed (any other exit)."""
+    async def _run_verifier(self, command: str, run_dir: Path) -> bool | str:
+        """True=pass, False=fail (exit 1), str=verifier crashed (any other exit).
+        run_dir is the composed project.cwd directory (issue #34), pre-checked
+        for existence by the caller."""
         try:
             argv = shlex.split(command)
         except ValueError as exc:
             return f"invalid verifier command {command!r}: {exc}"
         result = await run_process(
-            CommandSpec(argv=argv, cwd=verify_ws, timeout_seconds=_VERIFIER_TIMEOUT_SECONDS)
+            CommandSpec(argv=argv, cwd=run_dir, timeout_seconds=_VERIFIER_TIMEOUT_SECONDS)
         )
         if result.exit_code == 0:
             return True

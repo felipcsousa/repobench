@@ -25,6 +25,8 @@ SPEC = CheckSpec(
     apply_gold=True,
     apply_verifier=True,
     fail_code=RejectionCode.GOLD_FAILS,
+    pass_description="gold + hidden verifier passes",
+    fail_description="gold solution fails the hidden verifier",
 )
 
 

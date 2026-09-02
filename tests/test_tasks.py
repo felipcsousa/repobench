@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from tests.fixtures.gitutil import build_repo, git, make_candidate
+from tests.fixtures.gitutil import build_empty_base_repo, build_repo, git, make_candidate
 from repobench.core import gitutil
-from repobench.core.errors import RepoBenchError
+from repobench.core.errors import ReconstructionError, RepoBenchError
 from repobench.core.ids import new_task_id
 from repobench.core.types import (
     Complexity,
@@ -202,7 +202,7 @@ def test_build_task_package_rejects_missing_history(tmp_path: Path) -> None:
     fx = build_repo(tmp_path)
     candidate = make_candidate(fx)
     candidate.pr.base_sha = None
-    with pytest.raises(RuntimeError, match="history not reconstructable"):
+    with pytest.raises(ReconstructionError, match="history not reconstructable"):
         build_task_package(fx["repo"], candidate, tmp_path / "p1")
 
 
@@ -210,8 +210,34 @@ def test_build_task_package_rejects_unknown_base_sha(tmp_path: Path) -> None:
     fx = build_repo(tmp_path)
     candidate = make_candidate(fx)
     candidate.pr.base_sha = "0" * 40
-    with pytest.raises(RuntimeError, match="history not reconstructable"):
+    with pytest.raises(ReconstructionError, match="history not reconstructable"):
         build_task_package(fx["repo"], candidate, tmp_path / "p2")
+
+
+# ------------------------------------------------------- empty-tree base (issue #33)
+
+
+def test_tree_is_empty_flags_only_the_empty_tree_commit(tmp_path: Path) -> None:
+    built = build_empty_base_repo(tmp_path)
+    repo = built["repo"]
+    assert gitutil.tree_is_empty(repo, built["empty_fx"]["base_sha"]) is True
+    # the healthy PR's base and every later commit carry a real tree
+    assert gitutil.tree_is_empty(repo, built["empty_fx"]["merge_sha"]) is False
+    assert gitutil.tree_is_empty(repo, built["healthy_fx"]["merge_sha"]) is False
+
+
+def test_build_task_package_rejects_empty_tree_base(tmp_path: Path) -> None:
+    built = build_empty_base_repo(tmp_path)
+    candidate = make_candidate(built["empty_fx"])
+    with pytest.raises(ReconstructionError, match="empty tree") as excinfo:
+        build_task_package(built["repo"], candidate, tmp_path / "pkg")
+    # a typed RepoBenchError, never a bare RuntimeError or tarfile error
+    assert isinstance(excinfo.value, RepoBenchError)
+    assert not isinstance(excinfo.value, RuntimeError)
+    # the message names the PR and explains why it cannot become a task
+    message = str(excinfo.value)
+    assert f"PR #{candidate.pr.number}" in message
+    assert "adds the whole repository" in message
 
 
 def test_load_rejects_corrupt_metadata(tmp_path: Path) -> None:

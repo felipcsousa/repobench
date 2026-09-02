@@ -13,6 +13,9 @@ is surfaced in `details` with the tail of stdout/stderr. Inverted checks (noop,
 PRD §78) swap the two: a decisive exit 1 means the check passed. Commands always
 run with the plain inherited environment (env=None): trial-env sanitization is for
 harness execution, not for verifier runs.
+run in the configured project.cwd sub-directory when set (issue #34 — commands
+are argv-only, so `cd X && Y` is impossible); a workspace missing that directory
+is an inconclusive environment problem, never a crash.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ from pathlib import Path
 
 import pydantic
 
-from repobench.config import ProjectConfig
+from repobench.config import ProjectConfig, compose_cwd
 from repobench.core.types import ProcessResult, RejectionCode, TaskPackage
 from repobench.execution.process import run_sync
 from repobench.execution.workspace import Workspace, WorkspaceManager, apply_git_patch
@@ -48,7 +51,14 @@ class CheckResult(pydantic.BaseModel):
 
 @dataclass(frozen=True, kw_only=True)
 class CheckSpec:
-    """Declarative description of one historical-validation check (PRD §77-81)."""
+    """Declarative description of one historical-validation check (PRD §77-81).
+
+    `pass_description`/`fail_description` must state what a decisive outcome means
+    for this check's own command and workspace instead of being derived from the
+    apply_gold/apply_verifier flags: checks sharing a flag combination run different
+    commands over the same workspace state (oracle runs test_command over
+    gold+verifier; regression runs regression_command over that same state).
+    """
 
     name: str
     command_getter: Callable[[ProjectConfig], str | None]
@@ -56,6 +66,8 @@ class CheckSpec:
     apply_verifier: bool = False
     invert: bool = False  # True for noop: decisive exit 1 means the check PASSED
     fail_code: RejectionCode  # code when the decisive exit is the failing one
+    pass_description: str  # details for a decisive pass
+    fail_description: str  # decisive-fail details; exit code and output tail are appended unless invert
 
 
 def get_test_command(project: ProjectConfig) -> str | None:
@@ -112,33 +124,19 @@ def check_inconclusive(name: str, start: float, message: str) -> CheckResult:
 
 
 def _command_attr(spec: CheckSpec) -> str:
-    """Config attribute backing the spec's command: verifier checks use test_command,
-    baseline/regression-style checks use regression_command."""
-    return "test_command" if spec.apply_verifier else "regression_command"
-
-
-def _pass_details(spec: CheckSpec) -> str:
-    if spec.invert:
-        return "hidden verifier fails on BASE as required"
-    if spec.apply_gold and spec.apply_verifier:
-        return "gold + hidden verifier passes"
-    if spec.apply_gold:
-        return "gold passes the regression command"
-    return f"{spec.name} passes on BASE"
+    """ProjectConfig attribute backing the spec's command, derived from the getter
+    name (get_test_command -> test_command) so skip/inconclusive messages always
+    name the attribute that was actually consulted."""
+    return spec.command_getter.__name__.removeprefix("get_")
 
 
 def _fail_details(spec: CheckSpec, result: ProcessResult) -> str:
+    """Decisive-fail details: the spec's own description plus the exit code and the
+    output tail — except for inverted checks, whose description already tells the
+    whole story (the verifier passing on BASE needs no output)."""
     if spec.invert:
-        return (
-            "hidden verifier passed on the unmodified base; it must fail "
-            "without the gold solution (PRD §78)"
-        )
-    tail = output_tail(result)
-    if spec.apply_gold and spec.apply_verifier:
-        return f"gold solution fails the hidden verifier (exit {result.exit_code}): {tail}"
-    if spec.apply_gold:
-        return f"gold breaks the regression command (exit {result.exit_code}): {tail}"
-    return f"{spec.name} fails on BASE (exit {result.exit_code}): {tail}"
+        return spec.fail_description
+    return f"{spec.fail_description} (exit {result.exit_code}): {output_tail(result)}"
 
 
 def _run_spec(
@@ -152,9 +150,20 @@ def _run_spec(
     manager = ws = None
     try:
         manager, ws = new_trial(task, workspaces_root)
+        # Issue #34: install and the check command run in project.cwd when set;
+        # a workspace without that directory is an environment problem, surfaced
+        # as inconclusive — never a task defect, never a crash.
+        run_dir = compose_cwd(ws.repo_dir, project)
+        if not run_dir.is_dir():
+            return check_inconclusive(
+                spec.name,
+                start,
+                f"project.cwd {project.cwd!r} does not exist in the materialized "
+                f"workspace ({ws.repo_dir}) — fix project.cwd in repobench.yml",
+            )
         install_argv = split_command(project.install_command)
         if install_argv is not None:
-            install = run_sync(install_argv, ws.repo_dir)
+            install = run_sync(install_argv, run_dir)
             if install.exit_code != 0:
                 return check_inconclusive(
                     spec.name,
@@ -179,13 +188,13 @@ def _run_spec(
                     start,
                     f"verifier patch failed to apply: {err.strip()[-OUTPUT_TAIL_CHARS:]}",
                 )
-        result = run_sync(argv, ws.repo_dir)
+        result = run_sync(argv, run_dir)
         decisive_pass = (result.exit_code == 1) if spec.invert else (result.exit_code == 0)
         if decisive_pass:
             return CheckResult(
                 name=spec.name,
                 passed=True,
-                details=_pass_details(spec),
+                details=spec.pass_description,
                 duration_ms=elapsed_ms(start),
             )
         if result.exit_code in (0, 1):

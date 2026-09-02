@@ -36,6 +36,19 @@ def rev_parse(repo: Path, rev: str) -> str | None:
     return r.stdout.strip() or None if r.exit_code == 0 else None
 
 
+# Well-known hash of git's empty tree object (issue #33): the root tree of every
+# repository's initial commit before the first file lands on its parent side.
+EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+def tree_is_empty(repo: Path, sha: str) -> bool:
+    """True when `sha` resolves to a commit whose root tree is the empty tree —
+    e.g. a repository's initial commit, the merge base of a PR that adds the
+    whole repository (issue #33)."""
+    r = git_run(repo, "rev-parse", "--verify", "--quiet", f"{sha}^{{tree}}")
+    return r.exit_code == 0 and r.stdout.strip() == EMPTY_TREE_SHA
+
+
 def archive_commit(repo: Path, sha: str, out_tar: Path) -> bool:
     """`git archive` a commit into a tar file — the workspace materialization path (PRD §33)."""
     out_tar.parent.mkdir(parents=True, exist_ok=True)

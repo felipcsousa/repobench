@@ -6,13 +6,14 @@ task ids may contain characters Rich would otherwise interpret.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table as RichTable
 
-from repobench.config import RepoBenchConfig
+from repobench.config import RepoBenchConfig, detect_subprojects
 from repobench.core.types import AnalyzeSummary, CandidateInfo, ExecutionTarget
 from repobench.execution.pricing_catalog import lookup as catalog_lookup
 
@@ -34,7 +35,9 @@ def fail(message: str) -> None:
 
 
 def kv(label: str, value: str) -> None:
-    echo(f"{label:<28}{value}")
+    # The explicit space keeps long labels (>= 28 cols) from abutting the value;
+    # for shorter labels the padding absorbs it and the column is unchanged.
+    echo(f"{label:<27} {value}")
 
 
 def _target_provider(target: ExecutionTarget) -> str:
@@ -46,6 +49,22 @@ def _target_provider(target: ExecutionTarget) -> str:
     return "inherited"
 
 
+def _merge_style_label(styles) -> str:  # noqa: ANN001 - MergeStyleCounts
+    """e.g. "12 merge commits · 13 squash"; zero-count styles are omitted so the
+    line never claims work the repository does not have."""
+    parts = []
+    if styles.merge_commits:
+        parts.append(f"{styles.merge_commits} merge commits")
+    if styles.squash:
+        parts.append(f"{styles.squash} squash")
+    return " · ".join(parts)
+
+
+def _recall_label(mined: int, total: int) -> str:
+    counts = f"{mined}/{total} merged PRs"
+    return f"{counts} ({round(100 * mined / total)}%)" if total > 0 else counts
+
+
 def render_analyze_summary(
     outcome, suggested_size: int, lookback_note: str
 ) -> None:  # noqa: ANN001 - AnalyzeOutcome (avoids import cycle)
@@ -53,8 +72,19 @@ def render_analyze_summary(
     echo("RepoBench analyzed your repository")
     echo("")
     kv("Merged PRs", f"{outcome.merged_prs}")
+    # Issue #31 fields — getattr keeps the renderer usable with older outcomes.
+    styles = getattr(outcome, "merge_styles", None)
+    if styles is not None and styles.merge_commits + styles.squash > 0:
+        kv("Merge style", _merge_style_label(styles))
+    recall_total = getattr(outcome, "recall_total", None)
+    if recall_total is not None:
+        kv("Recall vs GitHub", _recall_label(outcome.merged_prs, recall_total))
     kv("Potential task candidates", f"{summary.task_candidates}")
-    kv("Validated eval candidates", str(summary.validated_candidates))
+    # Issue #35 honesty fix: analyze never validates anything (that happens in
+    # `benchmark build`), so the label must not claim it. The field name
+    # (`validated_candidates`) predates validation and only counts candidates
+    # that survived the mining hard filters.
+    kv("Candidates passing hard filters", str(summary.validated_candidates))
     echo("")
     echo("Workload")
     echo("")
@@ -74,6 +104,32 @@ def render_analyze_summary(
     echo("")
     echo(f"{lookback_note}")
     echo("No inference tokens were consumed.")
+
+
+def render_merge_style_warnings(outcome) -> None:  # noqa: ANN001 - AnalyzeOutcome
+    """Issue #31 field-credibility notes: squash-merged PRs are mined from
+    commit subjects, and — only when gh ground truth exists — recall low enough
+    to prove some history is invisible (rebase merges carry no PR number in git
+    at all). Without gh, nothing is claimed about recall."""
+    styles = getattr(outcome, "merge_styles", None)
+    if styles is not None and styles.squash:
+        plural = "s" if styles.squash != 1 else ""
+        echo(
+            f"{WARN} merge style: {styles.squash} squash-merged PR{plural} mined "
+            "from commit subjects (#N) — no merge commits for them exist"
+        )
+    recall_total = getattr(outcome, "recall_total", None)
+    if not recall_total:  # None (no gh) or 0 merged PRs — no honest recall claim
+        return
+    mined = outcome.merged_prs
+    if recall_total > 0 and round(100 * mined / recall_total) < 70:
+        missing = recall_total - mined
+        plural = "s" if missing != 1 else ""
+        echo(
+            f"{WARN} low recall: {missing} of {recall_total} merged PR"
+            f"{plural} in the window are invisible to mining — PRs merged by "
+            "rebase carry no PR number in git at all"
+        )
 
 
 def render_candidates_table(candidates: list[CandidateInfo]) -> None:
@@ -104,6 +160,70 @@ def render_candidates_table(candidates: list[CandidateInfo]) -> None:
             candidate.rejection_code.value if candidate.rejection_code else "—",
         )
     console.print(table)
+
+
+def _decode_details(raw: str | None) -> str | None:
+    """The task_validations column is named details_json but predates it:
+    rows store the plain check text (output tails included), never JSON.
+    Decode defensively so either encoding renders honestly (issue #35)."""
+    if raw is None:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        return raw
+    if isinstance(decoded, str):
+        return decoded
+    return json.dumps(decoded, ensure_ascii=False)
+
+
+def render_pr_diagnostics(
+    pr_number: int,
+    candidates: list[CandidateInfo],
+    task_rows: list[dict],
+    history_by_task: dict[str, list[dict]],
+) -> None:
+    """`candidates --show <PR>` (issue #35): why a PR became what it is.
+    Filtered before packaging → the mining rejection code; otherwise each
+    task's task_validations log (check, outcome, details with output tails) —
+    the diagnostics that used to require opening state.db by hand."""
+
+    def status_line(candidate: CandidateInfo) -> str:
+        line = candidate.status.value
+        if candidate.rejection_code is not None:
+            line += f" · rejection {candidate.rejection_code.value}"
+        return line
+
+    header = f"Candidate PR #{pr_number}"
+    if len(candidates) == 1:
+        header += f" — {status_line(candidates[0])}"
+    echo(header)
+    echo("")
+    if not candidates:
+        echo("(no candidate row recorded for this PR)")
+    elif len(candidates) > 1:
+        for candidate in candidates:
+            echo(f"  {status_line(candidate)}")
+        echo("")
+    if not task_rows:
+        echo("No tasks were packaged for this PR — it was filtered during mining,")
+        echo("before validation ran.")
+        return
+    for index, row in enumerate(task_rows):
+        if index:
+            echo("")
+        echo(f"Task {row['task_id']} (version {row['version']}) — {row['status']}")
+        checks = history_by_task.get(row["task_id"], [])
+        if not checks:
+            echo("  (no validation checks recorded)")
+            continue
+        for check in checks:
+            mark = {"passed": OK, "failed": MISS}.get(check["result"], "·")
+            echo(f"  {mark} {check['kind']:<16}{check['result']}")
+            details = _decode_details(check["details_json"])
+            if details:
+                for detail_line in details.splitlines() or [""]:
+                    echo(f"      {detail_line}")
 
 
 def _target_pricing_label(target: ExecutionTarget, cfg: RepoBenchConfig) -> str:
@@ -385,6 +505,32 @@ def render_clean_plan(plan, *, apply: bool) -> None:  # noqa: ANN001 - CleanPlan
     echo(f"approx. {plan.freed_bytes / 1_048_576:.1f} MB freed")
 
 
+def subproject_summary_lines(root: Path) -> list[str]:
+    """Issue #34: one honest line per detected sub-project — the backend the
+    old root-only detection silently ignored. Empty when none exist, so callers
+    never print a monorepo header for a single-project repo. A sub-project
+    without a test command says so instead of inventing one."""
+    projects = detect_subprojects(root)
+    if not projects:
+        return []
+    lines = [
+        "sub-projects detected (one command set benchmarks — project.cwd picks where it runs):"
+    ]
+    for project in projects:
+        cfg = project.config
+        identity = [project.path, cfg.language or "unknown"]
+        if cfg.package_manager:
+            identity.append(cfg.package_manager)
+        if cfg.install_command:
+            identity.append(f"install: {cfg.install_command}")
+        if cfg.test_command:
+            identity.append(f"test: {cfg.test_command}")
+        else:
+            identity.append("no test command — set project.test_command or project.cwd")
+        lines.append("  " + " · ".join(identity))
+    return lines
+
+
 def config_summary_lines(cfg: RepoBenchConfig, root: Path) -> list[str]:
     project = cfg.project
     lines = [
@@ -392,10 +538,21 @@ def config_summary_lines(cfg: RepoBenchConfig, root: Path) -> list[str]:
         f"language:  {project.language or 'not detected'}",
         f"packages:  {project.package_manager or 'not detected'}",
     ]
+    if project.cwd:
+        # Issue #34: the monorepo knob is part of the summary so a configured
+        # sub-directory is always visible next to the commands it redirects.
+        lines.append(f"cwd:       {project.cwd}")
     if project.install_command:
         lines.append(f"install:   {project.install_command}")
     if project.test_command:
         lines.append(f"test:      {project.test_command}")
+    elif project.language:
+        # Issue #34 honesty: say so instead of implying `npm test` exists —
+        # an invented suggestion guarantees BASELINE_BROKEN at first build.
+        lines.append("test:      none detected — set project.test_command in repobench.yml")
+    # Issue #34: surface every sub-project so the ignored backend is seen
+    # before the first build, not after a guaranteed-broken run.
+    lines.extend(subproject_summary_lines(root))
     lines.append("edit repobench.yml to adjust commands, targets and benchmark size.")
     return lines
 

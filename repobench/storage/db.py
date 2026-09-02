@@ -160,7 +160,28 @@ class Storage:
             rows = self.query("SELECT data_json FROM candidates ORDER BY pr_number")
         return [CandidateInfo.model_validate_json(r["data_json"]) for r in rows]
 
+    def candidates_for_pr(self, pr_number: int) -> list[CandidateInfo]:
+        """Candidate rows mined for one PR — the `candidates --show` lookup
+        (issue #35). A PR may hold several rows over time (re-mining with a
+        different base sha mints a new candidate_id)."""
+        rows = self.query(
+            "SELECT data_json FROM candidates WHERE pr_number = ? ORDER BY created_at",
+            (pr_number,),
+        )
+        return [CandidateInfo.model_validate_json(r["data_json"]) for r in rows]
+
     # -- tasks --
+
+    def tasks_for_pr(self, pr_number: int) -> list[dict[str, Any]]:
+        """Task rows packaged for one PR — the PR number → candidate_id →
+        task_id join that surfaces task_validations per PR (issue #35). Empty
+        when the PR was filtered during mining, before any packaging."""
+        return self.query(
+            "SELECT t.task_id, t.status, t.version FROM tasks t "
+            "JOIN candidates c ON c.candidate_id = t.candidate_id "
+            "WHERE c.pr_number = ? ORDER BY t.created_at, t.task_id",
+            (pr_number,),
+        )
 
     def save_task(
         self,

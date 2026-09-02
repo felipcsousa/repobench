@@ -1,8 +1,13 @@
-"""Benchmark module tests: greedy sampling, coverage, health, manifests (PRD §83-89)."""
+"""Benchmark module tests: greedy sampling, coverage, health, manifests (PRD §83-89),
+plus the `benchmark build` loop guard for unreconstructable candidates (issue #33)."""
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import sys
+
+import pytest
 
 from repobench.benchmark import (
     CoverageReport,
@@ -13,15 +18,21 @@ from repobench.benchmark import (
     load_manifest,
     save_manifest,
 )
-from repobench.config import BenchmarkConfig, BenchmarkDimensions
+from repobench.cli.builds import build_benchmark
+from repobench.config import BenchmarkConfig, BenchmarkDimensions, ProjectConfig, RepoBenchConfig
+from repobench.core.errors import UsageError
 from repobench.core.ids import METHODOLOGY_VERSION
 from repobench.core.types import (
     Assessment,
     Complexity,
+    RejectionCode,
     TaskMetadata,
+    TaskStatus,
     TaskType,
     WorkloadDistribution,
 )
+from repobench.storage.db import Storage
+from tests.fixtures.gitutil import build_empty_base_repo, make_candidate
 
 NOW = datetime(2026, 9, 1, tzinfo=timezone.utc)
 
@@ -235,3 +246,66 @@ class TestManifest:
         assert path.name == "manifest.json"
         loaded = load_manifest(tmp_path / "benchmarks" / "abc")
         assert loaded == manifest
+
+
+# ------------------------------------------- empty-tree base candidates (issue #33)
+
+
+def _build_cfg() -> RepoBenchConfig:
+    """Config whose verifier commands are the local pytest — hermetic, as in the e2e suite."""
+    cfg = RepoBenchConfig()
+    pytest_cmd = f'"{sys.executable}" -m pytest -q'
+    cfg.project = ProjectConfig(
+        language="python",
+        test_command=pytest_cmd,
+        regression_command=pytest_cmd,
+    )
+    return cfg
+
+
+def test_build_benchmark_skips_empty_tree_base_and_builds_the_rest(tmp_path: Path) -> None:
+    built = build_empty_base_repo(tmp_path)
+    repo = built["repo"]
+    empty_fx, healthy_fx = built["empty_fx"], built["healthy_fx"]
+    storage = Storage(tmp_path / "state.db")
+    storage.save_candidate(make_candidate(empty_fx))
+    storage.save_candidate(make_candidate(healthy_fx))
+
+    lines: list[str] = []
+    outcome = build_benchmark(repo, _build_cfg(), storage, log=lines.append)
+
+    # the healthy task was produced and shipped; the empty-tree PR never was
+    assert [r.candidate.pr.number for r in outcome.valid] == [healthy_fx["number"]]
+    assert len(outcome.sample) == 1
+    assert [c.pr.number for c in outcome.reconstruction_rejected] == [empty_fx["number"]]
+    assert all(task["pr_number"] == healthy_fx["number"] for task in storage.list_tasks())
+
+    # the rejected candidate is persisted like any other rejection
+    persisted = {c.pr.number: c for c in storage.list_candidates()}
+    assert persisted[empty_fx["number"]].status is TaskStatus.REJECTED
+    assert persisted[empty_fx["number"]].rejection_code is RejectionCode.HISTORY_UNSUPPORTED
+    assert persisted[healthy_fx["number"]].status is TaskStatus.VALID
+
+    # and the per-PR outcome line was logged in the usual style
+    assert any(
+        line.startswith(f"PR #{empty_fx['number']}: REJECTED (HISTORY_UNSUPPORTED)")
+        for line in lines
+    )
+
+
+def test_build_benchmark_all_empty_tree_candidates_raise_honest_usage_error(
+    tmp_path: Path,
+) -> None:
+    built = build_empty_base_repo(tmp_path)
+    storage = Storage(tmp_path / "state.db")
+    storage.save_candidate(make_candidate(built["empty_fx"]))
+
+    with pytest.raises(UsageError) as excinfo:
+        build_benchmark(built["repo"], _build_cfg(), storage)
+
+    assert "HISTORY_UNSUPPORTED" in str(excinfo.value)
+    assert storage.list_benchmarks() == []
+    # the rejection is still recorded even though the build aborts
+    persisted = storage.list_candidates()[0]
+    assert persisted.status is TaskStatus.REJECTED
+    assert persisted.rejection_code is RejectionCode.HISTORY_UNSUPPORTED

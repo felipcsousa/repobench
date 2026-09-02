@@ -1,15 +1,25 @@
-"""Foundation tests: config, ids, paths, test-path classification, storage, process
-runner, synthetic workspaces, environment sanitization."""
+"""Foundation tests: config, ids, paths, test-path classification, storage,
+process runner, synthetic workspaces, environment sanitization."""
 
 from __future__ import annotations
 
+import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from repobench.config import RepoBenchConfig, default_config_for
+from repobench.config import (
+    ProjectConfig,
+    RepoBenchConfig,
+    compose_cwd,
+    default_config_for,
+    detect_project_environment,
+    detect_subprojects,
+)
 from repobench.core.ids import new_benchmark_id, new_task_id, new_trial_id
 from repobench.core.paths import ProjectPaths, find_repo_root
 from repobench.core.testpaths import is_test_path, split_changed_paths
@@ -89,12 +99,114 @@ def test_default_config_detection(base_repo: Path) -> None:
     assert cfg.project.language == "python"
     # Detected commands use the running interpreter — a bare "python" does not
     # exist on macOS, and the suggestion would reject every task at build time.
-    import shlex
-    import sys
-
     py = shlex.quote(sys.executable)
     assert cfg.project.test_command == f"{py} -m pytest"
     assert cfg.project.install_command == f"{py} -m pip install -e ."
+
+
+# ------------------------------------------- monorepo detection (issue #34)
+
+
+def _write_package_json(directory: Path, payload: dict) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "package.json").write_text(json.dumps(payload))
+
+
+def test_root_package_json_with_test_script_suggests_npm_test(tmp_path: Path) -> None:
+    _write_package_json(tmp_path, {"name": "root", "scripts": {"test": "jest"}})
+    cfg = detect_project_environment(tmp_path)
+    assert (cfg.language, cfg.package_manager) == ("javascript-typescript", "npm")
+    assert cfg.test_command == "npm test"
+    assert cfg.regression_command == "npm test"
+
+
+def test_root_package_json_without_test_script_suggests_no_test_command(tmp_path: Path) -> None:
+    """The lumpfish guarantee (issue #34): no `scripts.test` means no `npm test`
+    suggestion — a None test_command is rejected honestly by validation, while
+    an invented command breaks every baseline."""
+    _write_package_json(tmp_path, {"name": "root", "scripts": {"build": "tsc"}})
+    cfg = detect_project_environment(tmp_path)
+    assert (cfg.language, cfg.package_manager) == ("javascript-typescript", "npm")
+    assert cfg.test_command is None
+    assert cfg.regression_command is None
+
+
+def test_js_framework_suggestion_does_not_need_a_test_script(tmp_path: Path) -> None:
+    """vitest/jest stay suggested from dependencies alone: `npx vitest run`
+    works without a `scripts.test` entry."""
+    _write_package_json(
+        tmp_path, {"name": "root", "scripts": {"build": "tsc"}, "devDependencies": {"vitest": "^1"}}
+    )
+    cfg = detect_project_environment(tmp_path)
+    assert cfg.test_command == "npx vitest run"
+
+
+def test_detect_subprojects_mixed_monorepo(tmp_path: Path) -> None:
+    """Issue #34: npm root (test script present) + python backend; apps/* and
+    packages/* are scanned one level deep; dependency junk is never a project."""
+    _write_package_json(tmp_path, {"name": "root", "scripts": {"test": "jest"}})
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "backend" / "pyproject.toml").write_text("[project]\nname = 'api'\n")
+    _write_package_json(
+        tmp_path / "apps" / "mobile", {"name": "mobile", "scripts": {"build": "expo build"}}
+    )
+    _write_package_json(
+        tmp_path / "packages" / "ui",
+        {"name": "ui", "devDependencies": {"vitest": "^1"}},
+    )
+    (tmp_path / "packages" / "ui" / "pnpm-lock.yaml").write_text("lockfileVersion: 9\n")
+    # junk that must never surface as a project
+    _write_package_json(tmp_path / "apps" / "node_modules" / "react", {"name": "react"})
+    (tmp_path / "services" / ".venv").mkdir(parents=True)
+    (tmp_path / "services" / ".venv" / "pyproject.toml").write_text("[project]\nname = 'v'\n")
+
+    by_path = {sub.path: sub.config for sub in detect_subprojects(tmp_path)}
+    assert set(by_path) == {"apps/mobile", "backend", "packages/ui"}
+
+    py = shlex.quote(sys.executable)
+    backend = by_path["backend"]
+    assert backend.language == "python"
+    assert backend.test_command == f"{py} -m pytest"
+
+    mobile = by_path["apps/mobile"]
+    assert (mobile.language, mobile.package_manager) == ("javascript-typescript", "npm")
+    assert mobile.test_command is None  # no scripts.test — never invent `npm test`
+
+    ui = by_path["packages/ui"]
+    assert (ui.language, ui.package_manager) == ("javascript-typescript", "pnpm")
+    assert ui.test_command == "pnpm vitest run"
+
+    # the root is never listed as its own sub-project and keeps its suggestion
+    root = detect_project_environment(tmp_path)
+    assert (root.language, root.package_manager, root.test_command) == (
+        "javascript-typescript",
+        "npm",
+        "npm test",
+    )
+
+
+def test_detect_subprojects_empty_for_markerless_dirs(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "backend" / "README.md").write_text("docs, not a project")
+    (tmp_path / "apps").mkdir()  # glob root without children
+    assert detect_subprojects(tmp_path) == []
+
+
+def test_project_cwd_validation() -> None:
+    """project.cwd must stay inside the repository: relative, no `..`, never
+    empty — the join against a workspace root must not be able to escape."""
+    assert ProjectConfig(cwd="backend").cwd == "backend"
+    assert ProjectConfig(cwd="backend/sub/").cwd == "backend/sub"  # normalized, POSIX
+    assert ProjectConfig(cwd="./api").cwd == "api"
+    for bad in ("/absolute/path", "../outside", "a/../../b", "   ", ""):
+        with pytest.raises(ValidationError):
+            ProjectConfig(cwd=bad)
+
+
+def test_compose_cwd(tmp_path: Path) -> None:
+    assert compose_cwd(tmp_path, ProjectConfig()) == tmp_path
+    assert compose_cwd(tmp_path, ProjectConfig(cwd="backend")) == tmp_path / "backend"
 
 
 def test_ids() -> None:

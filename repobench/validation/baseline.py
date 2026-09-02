@@ -20,6 +20,8 @@ SPEC = CheckSpec(
     name=CHECK_NAME,
     command_getter=get_regression_command,
     fail_code=RejectionCode.BASELINE_BROKEN,
+    pass_description="baseline passes on BASE",
+    fail_description="baseline fails on BASE",
 )
 
 

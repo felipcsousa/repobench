@@ -278,6 +278,9 @@ class TestPublicRepository:
             def enrich(self, pr):  # noqa: ANN001 - PRInfo
                 return pr
 
+            def merged_pr_count(self, since, limit=500):  # noqa: ANN001 - issue #31
+                return None  # no ground truth in this stub — recall stays hidden
+
             def visibility(self) -> str:
                 return "PUBLIC"
 
@@ -556,12 +559,15 @@ class TestSeedAndConfigCleanup:
         data = json.loads(_invoke("report", "--format", "json").output)
         assert data["bootstrap_seed"] == 7
 
-    def test_analyze_label_matches_prd10(
+    def test_analyze_label_claims_filters_not_validation(
         self, fixture_repo: Path, fake_agent_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # Issue #35: analyze never validates (that happens in `benchmark build`),
+        # so the summary label must not claim it either.
         _fast_forward(fixture_repo, fake_agent_path, monkeypatch)
         result = _invoke("analyze")
-        assert "Validated eval candidates" in result.output
+        assert "Candidates passing hard filters" in result.output
+        assert "Validated eval candidates" not in result.output
 
 
 # ------------------------------------------------------- #4 runs / #9 clean

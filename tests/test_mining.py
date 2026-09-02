@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.fixtures.gitutil import git, make_pr
+from tests.fixtures.gitutil import git, make_pr, squash_pr
 from repobench.config import TaskMiningConfig
 from repobench.core.types import Complexity, IssueInfo, PRInfo, RejectionCode, TaskStatus, TaskType
 from repobench.mining.candidates import mine_candidates
@@ -47,6 +47,10 @@ ENRICH_TEXTS = {
     4: (
         "add bulk upload pipeline",
         "Adds a bulk upload pipeline so enterprise merchants can import large catalogs without scripted API calls.",
+    ),
+    5: (
+        "fix: charge rounding drops cents",
+        "Customers report the charged amount is off by a few cents whenever the cart mixes discounted items with taxes applied.",
     ),
 }
 
@@ -346,6 +350,28 @@ def test_mine_candidates_end_to_end(mining_repo: Path) -> None:
     assert by_number[2].rejection_code is RejectionCode.NO_TEST_CHANGE
     assert by_number[3].rejection_code is RejectionCode.TASK_TOO_SMALL
     assert by_number[4].rejection_code is RejectionCode.TASK_TOO_LARGE
+
+
+def test_mine_candidates_includes_squash_pr(mining_repo: Path) -> None:
+    """Issue #31: a squash-merged PR (subject `(#N)`, single parent, no merge
+    commit) is minable exactly like a merge-commit PR."""
+    squash_pr(
+        mining_repo,
+        5,
+        {
+            "src/payments/gateway.py": "a\nb\nc\nd\ne\n",
+            "tests/test_gateway.py": "x\ny\n",
+        },
+        "fix: charge rounding drops cents",
+    )
+    candidates = mine_candidates(GitRepo(mining_repo), CFG, enrich=_text_enricher)
+    by_number = {candidate.pr.number: candidate for candidate in candidates}
+    assert set(by_number) == {1, 2, 3, 4, 5}
+    squashed = by_number[5]
+    assert squashed.status is TaskStatus.DISCOVERED and squashed.rejection_code is None
+    # the squashed commit IS the PR: head and merge are the same commit
+    assert squashed.pr.head_sha == squashed.pr.merge_sha
+    assert squashed.pr.base_sha != squashed.pr.merge_sha
 
 
 def test_mine_candidates_skips_bots_and_bad_enrichment(mining_repo: Path) -> None:

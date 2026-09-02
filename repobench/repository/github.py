@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from repobench.core.types import IssueInfo, PRInfo, ProcessResult
@@ -119,6 +119,44 @@ class GitHubClient:
     def find_linked_issue_number(body: str) -> int | None:
         match = _LINKED_ISSUE_RE.search(body or "")
         return int(match.group(2)) if match else None
+
+    def merged_pr_count(self, since: datetime, limit: int = 500) -> int | None:
+        """Ground truth for mining recall (issue #31): how many PRs GitHub says
+        were merged since `since`, from `gh pr list --state merged` with a
+        client-side mergedAt filter. Entries without a parseable mergedAt cannot
+        be placed in the window and are skipped. None on any failure, like every
+        other gh call."""
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        result = self._run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--state",
+                "merged",
+                "--limit",
+                str(limit),
+                "-R",
+                self.slug,
+                "--json",
+                "number,mergedAt",
+            ]
+        )
+        if result.exit_code != 0 or not result.stdout.strip():
+            return None
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, list):
+            return None
+        count = 0
+        for item in data:
+            merged_at = _parse_datetime(item.get("mergedAt")) if isinstance(item, dict) else None
+            if merged_at is not None and merged_at >= since:
+                count += 1
+        return count
 
     def enrich(self, pr: PRInfo) -> PRInfo:
         """Fill PR metadata + linked issue from GitHub. Returns the input PR on any failure."""
