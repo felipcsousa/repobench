@@ -328,10 +328,26 @@ def candidates(
 def benchmark_build(
     ctx: typer.Context,
     size: Optional[int] = typer.Option(None, help="Benchmark size override."),
+    reuse_valid: bool = typer.Option(
+        False,
+        "--reuse-valid",
+        help=(
+            "Skip re-validating candidates that already validated VALID in a "
+            "previous build (issue #16); leakage is still checked."
+        ),
+    ),
+    force_revalidate: bool = typer.Option(
+        False,
+        "--force-revalidate",
+        help=(
+            "Re-validate every candidate from scratch — wins when combined "
+            "with --reuse-valid."
+        ),
+    ),
 ) -> None:
     """Validate tasks and sample a representative benchmark (PRD §88-89)."""
     from repobench.cli import render
-    from repobench.cli.services import build_benchmark
+    from repobench.cli.builds import build_benchmark
     from repobench.core.errors import RepoBenchError
 
     if size is not None and size < 1:
@@ -340,13 +356,71 @@ def benchmark_build(
     try:
         root, _paths, cfg, storage = _service_context(ctx)
         outcome = build_benchmark(
-            root, cfg, storage, size=size, log=render.render_task_build_line
+            root,
+            cfg,
+            storage,
+            size=size,
+            reuse_valid=reuse_valid and not force_revalidate,
+            log=render.render_task_build_line,
         )
     except RepoBenchError as exc:
         _fail(str(exc))
         return
     render.echo("Validated task candidates:")
     render.render_benchmark_build(outcome)
+    render.echo("")
+    render.echo("Next: repobench run --all")
+
+
+@benchmark_app.command("refresh")
+def benchmark_refresh(
+    ctx: typer.Context,
+    benchmark: Optional[str] = typer.Option(
+        None, "--benchmark", help="Benchmark id to refresh (default: latest)."
+    ),
+    size: Optional[int] = typer.Option(
+        None, help="Benchmark size override (default: the refreshed benchmark's size)."
+    ),
+    reuse_valid: bool = typer.Option(
+        False,
+        "--reuse-valid",
+        help=(
+            "Skip re-validating candidates that already validated VALID in a "
+            "previous build (issue #16); leakage is still checked."
+        ),
+    ),
+    force_revalidate: bool = typer.Option(
+        False,
+        "--force-revalidate",
+        help=(
+            "Re-validate every candidate from scratch — wins when combined "
+            "with --reuse-valid (same precedence as `benchmark build`)."
+        ),
+    ),
+) -> None:
+    """Re-measure benchmark drift against the evolving repo and rebuild (issue #15, PRD §148)."""
+    from repobench.cli import render
+    from repobench.cli.builds import refresh_benchmark
+    from repobench.core.errors import RepoBenchError
+
+    if size is not None and size < 1:
+        _fail("--size must be at least 1")
+        return
+    try:
+        root, _paths, cfg, storage = _service_context(ctx)
+        outcome = refresh_benchmark(
+            root,
+            cfg,
+            storage,
+            benchmark_id=benchmark,
+            size=size,
+            reuse_valid=reuse_valid and not force_revalidate,
+            log=render.render_task_build_line,
+        )
+    except RepoBenchError as exc:
+        _fail(str(exc))
+        return
+    render.render_benchmark_refresh(outcome)
     render.echo("")
     render.echo("Next: repobench run --all")
 
@@ -420,7 +494,9 @@ def run(
     keep_workspaces: bool = typer.Option(
         False, "--keep-workspaces", help="Keep trial workspaces under .repobench/workspaces/."
     ),
-    rollouts: int = typer.Option(1, help="Trials per Task×Target (V1 supports 1; V1.5 adds more)."),
+    rollouts: int = typer.Option(
+        1, help="Rollouts per Task×Target; enables pass@k / pass^k reliability stats (issue #13)."
+    ),
 ) -> None:
     """Execute Benchmark × Targets locally (PRD §96-99)."""
     from repobench.cli import render
@@ -433,8 +509,8 @@ def run(
     )
     from repobench.core.errors import RepoBenchError
 
-    if rollouts != 1:
-        _fail("multiple rollouts arrive in V1.5 (PRD §103); V1 supports exactly 1 rollout")
+    if rollouts < 1:
+        _fail(f"--rollouts must be at least 1, got {rollouts}")
         return
 
     try:
@@ -458,6 +534,7 @@ def run(
             retry_failed=retry_failed,
             jobs=jobs,
             keep=True if keep_workspaces else None,
+            rollouts=rollouts,
         )
     except RepoBenchError as exc:
         _fail(str(exc))
@@ -529,6 +606,41 @@ def report(
         typer.echo(render_csv(trials, tasks), nl=False)
     else:
         render.echo(render_report(data))
+
+
+# -------------------------------------------------------------------- compare
+
+
+@app.command()
+def compare(
+    ctx: typer.Context,
+    run_a: str = typer.Argument(..., help="Baseline run id (A)."),
+    run_b: str = typer.Argument(..., help="Run compared against the baseline (B)."),
+    format: str = typer.Option("text", "--format", help="text | json."),
+) -> None:
+    """Compare one run against a baseline run (PRD §149, issue #14)."""
+    import json
+    from dataclasses import asdict
+
+    from repobench.cli import render
+    from repobench.cli.reports import build_compare
+    from repobench.core.errors import RepoBenchError
+
+    if format not in ("text", "json"):
+        _fail(f"unknown compare format: {format!r} (expected text | json)")
+        return
+
+    try:
+        root, _paths, _cfg, storage = _service_context(ctx)
+        outcome = build_compare(root, storage, run_a, run_b)
+    except RepoBenchError as exc:
+        _fail(str(exc))
+        return
+
+    if format == "json":
+        typer.echo(json.dumps(asdict(outcome), indent=2))
+    else:
+        render.render_compare(outcome)
 
 
 # ----------------------------------------------------------------------- runs

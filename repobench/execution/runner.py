@@ -137,6 +137,7 @@ class TrialExecutor:
         *,
         run_id: str | None = None,
         benchmark_id: str | None = None,
+        rollout: int = 1,
     ) -> TrialResult:
         started_at = utcnow()
         trial_id = new_trial_id()
@@ -149,6 +150,7 @@ class TrialExecutor:
                 started_at=started_at,
                 run_id=run_id,
                 benchmark_id=benchmark_id,
+                rollout=rollout,
                 ctx=ctx,
             )
         except Exception as exc:  # never raise — a crashing trial is still a result (PRD §99)
@@ -161,6 +163,7 @@ class TrialExecutor:
                 benchmark_id=benchmark_id,
                 task_id=task.task_id,
                 target_id=target.id,
+                rollout=rollout,
                 harness=target.harness,
                 model=target.model,
                 provider=target.provider,
@@ -182,6 +185,7 @@ class TrialExecutor:
         started_at: datetime,
         run_id: str | None,
         benchmark_id: str | None,
+        rollout: int,
         ctx: dict,
     ) -> TrialResult:
         adapter = self._adapter_lookup(target.harness)
@@ -191,6 +195,7 @@ class TrialExecutor:
             "benchmark_id": benchmark_id,
             "task_id": task.task_id,
             "target_id": target.id,
+            "rollout": rollout,
             "harness": adapter.name,
             "harness_version": cached_harness_version(adapter),
             "model": target.model,
@@ -462,7 +467,7 @@ class TrialExecutor:
 
 
 async def run_matrix(
-    pairs: list[tuple[TaskPackage, ExecutionTarget]],
+    pairs: list[tuple[TaskPackage, ExecutionTarget, int]],
     executor: TrialExecutor,
     *,
     run_id: str | None = None,
@@ -470,16 +475,18 @@ async def run_matrix(
     jobs: int = 1,
     progress: Callable[[TrialResult], None] | None = None,
 ) -> list[TrialResult]:
-    """Execute the given Task x Target pairs with bounded concurrency (PRD §57).
-
-    Results are returned in completion order.
+    """Execute the given (task, target, rollout) pairs with bounded concurrency
+    (PRD §57, issue #13). Rollout expansion happens in the planner; this stays a
+    dumb executor. Results are returned in completion order.
     """
     results: list[TrialResult] = []
     semaphore = asyncio.Semaphore(max(1, jobs))
 
-    async def _one(task: TaskPackage, target: ExecutionTarget) -> None:
+    async def _one(task: TaskPackage, target: ExecutionTarget, rollout: int) -> None:
         async with semaphore:
-            trial = await executor.execute(task, target, run_id=run_id, benchmark_id=benchmark_id)
+            trial = await executor.execute(
+                task, target, run_id=run_id, benchmark_id=benchmark_id, rollout=rollout
+            )
             results.append(trial)
             if progress is not None:
                 try:
@@ -489,5 +496,5 @@ async def run_matrix(
                         "progress callback failed for trial %s: %s", trial.trial_id, exc
                     )
 
-    await asyncio.gather(*(_one(task, target) for task, target in pairs))
+    await asyncio.gather(*(_one(task, target, rollout) for task, target, rollout in pairs))
     return results

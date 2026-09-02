@@ -177,14 +177,13 @@ def test_run_requires_benchmark_and_known_targets(
     assert "no targets specified" in no_targets.output
 
 
-def test_run_rejects_multiple_rollouts(
+def test_run_rejects_non_positive_rollouts(
     fixture_repo: Path, fake_agent_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _fast_forward(fixture_repo, fake_agent_path, monkeypatch)
-    result = _invoke("run", "fixer", "--yes", "--rollouts", "3")
+    result = _invoke("run", "fixer", "--yes", "--rollouts", "0")
     assert result.exit_code == 1
-    assert "V1.5" in result.output
-    assert "PRD §103" in result.output
+    assert "at least 1" in result.output
 
 
 def test_run_resume_skips_completed_trials(

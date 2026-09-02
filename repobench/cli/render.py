@@ -141,6 +141,9 @@ def render_capability_row(name: str, caps) -> str:  # noqa: ANN001 - HarnessCapa
 def render_benchmark_build(outcome) -> None:  # noqa: ANN001 - BenchmarkBuildOutcome
     echo("")
     kv("Valid candidates", str(len(outcome.valid)))
+    if getattr(outcome, "reuse_valid", False):
+        # Incremental builds only (issue #16): how many tasks skipped revalidation.
+        kv("Reused valid tasks", str(outcome.reused))
     kv("Requested benchmark size", str(outcome.requested_size))
     echo("")
     if len(outcome.valid) < outcome.requested_size:
@@ -176,6 +179,49 @@ def render_benchmark_build(outcome) -> None:  # noqa: ANN001 - BenchmarkBuildOut
     echo(f"manifest: {outcome.manifest_path}")
 
 
+def render_benchmark_refresh(outcome) -> None:  # noqa: ANN001 - RefreshOutcome
+    """`benchmark refresh` (issue #15, PRD §148): the drift story first, then
+    the task turnover of the rebuild. The Reason block only appears when a
+    derived reason exists — nothing is invented."""
+    drift = outcome.drift
+    delta = drift.overall_after - drift.overall_before
+    coverage_line = (
+        f"Coverage: {drift.overall_before} → {drift.overall_after} ({delta:+d})"
+    )
+    echo("Benchmark refresh")
+    echo("")
+    echo(f"{outcome.old_benchmark_id} → {outcome.new_benchmark_id}")
+    echo("")
+    echo("Drift")
+    echo("")
+    if drift.drifted:
+        echo(coverage_line)
+    else:
+        echo(f"{coverage_line} — benchmark still representative")
+    dims = drift.per_dimension
+    echo(
+        f"task_type {dims['task_type'][0]} → {dims['task_type'][1]}"
+        f" · subsystem {dims['subsystem'][0]} → {dims['subsystem'][1]}"
+        f" · complexity {dims['complexity'][0]} → {dims['complexity'][1]}"
+    )
+    if drift.reasons:
+        echo("Reason:")
+        for reason in drift.reasons:
+            echo(reason)
+    echo("")
+    tasks_line = (
+        f"Tasks: {outcome.new_tasks} new · {outcome.retained_tasks} retained"
+        f" · {len(outcome.build.sample)} total"
+    )
+    if outcome.missing_tasks:
+        tasks_line += f" · {outcome.missing_tasks} missing"
+    echo(tasks_line)
+    if getattr(outcome.build, "reuse_valid", False):
+        # Incremental refresh only (issue #16): how many tasks skipped revalidation.
+        kv("Reused valid tasks", str(outcome.build.reused))
+    echo(f"manifest: {outcome.new_manifest_path}")
+
+
 def render_public_repository_warning() -> None:
     """The PRD §51 contamination warning block, verbatim in spirit."""
     echo("")
@@ -196,6 +242,9 @@ def render_run_preview(plan, benchmark_note: str) -> None:  # noqa: ANN001 - Run
     kv("Tasks", str(len(plan.tasks)))
     kv("Targets", ", ".join(t.id for t in plan.targets))
     kv("Trials", str(len(plan.pairs)))
+    if plan.rollouts > 1:
+        # PRD §103: the cost multiplier of multiple rollouts must be explicit.
+        kv("Rollouts", f"{plan.rollouts} per Task×Target (cost ×{plan.rollouts})")
     if plan.already_complete:
         kv("Already complete", f"{plan.already_complete} (resuming)")
     if getattr(plan, "retried", 0):
@@ -333,3 +382,67 @@ def config_summary_lines(cfg: RepoBenchConfig, root: Path) -> list[str]:
         lines.append(f"test:      {project.test_command}")
     lines.append("edit repobench.yml to adjust commands, targets and benchmark size.")
     return lines
+
+
+# ------------------------------------------------------------------- compare
+
+
+def render_compare(outcome) -> None:  # noqa: ANN001 - CompareOutcome
+    """`repobench compare` (PRD §149, issue #14): overall B − A deltas with
+    paired-bootstrap CIs, cost drift, pooled segment drift and warnings."""
+    echo("Compare runs")
+    echo("")
+    echo(f"{outcome.run_a} → {outcome.run_b} (benchmark {outcome.benchmark_id or '—'})")
+    if outcome.tasks_only_a or outcome.tasks_only_b:
+        echo(
+            f"tasks only in A: {outcome.tasks_only_a} · "
+            f"tasks only in B: {outcome.tasks_only_b}"
+        )
+    echo("")
+    echo("Overall")
+    echo("")
+    if not outcome.targets:
+        echo("(no trials recorded for either run)")
+    for delta in outcome.targets:
+        verdict = "conclusive" if delta.conclusive else "not conclusive"
+        echo(
+            f"{delta.target_id}  {delta.rate_a * 100:.0f}% → {delta.rate_b * 100:.0f}%"
+            f"  ({delta.diff_pp:+.0f}pp)  "
+            f"[95% CI {delta.ci_lo_pp:+.0f}pp → {delta.ci_hi_pp:+.0f}pp, {verdict}]"
+        )
+    echo("")
+    echo("Cost")
+    echo("")
+    cost_rows = [
+        delta
+        for delta in outcome.targets
+        if delta.cost_a is not None
+        and delta.cost_b is not None
+        and delta.cost_delta_pct is not None
+    ]
+    if cost_rows:
+        for delta in cost_rows:
+            echo(
+                f"{delta.target_id}  ${delta.cost_a:.2f} → ${delta.cost_b:.2f}"
+                f"  ({delta.cost_delta_pct:+.0f}%)"
+            )
+    else:
+        # Costs are only shown when both runs reported them — never invented.
+        echo("(no cost reported by both runs)")
+    for dimension, deltas in outcome.segments.items():
+        echo("")
+        echo(f"Segments — {dimension}")
+        echo("")
+        if not deltas:
+            echo("(no segments shared by both runs)")
+        for delta in deltas:
+            echo(
+                f"{delta.segment:<16}{delta.rate_a * 100:.0f}% → {delta.rate_b * 100:.0f}%"
+                f"  ({delta.diff_pp:+.0f}pp)"
+            )
+    if outcome.warnings:
+        echo("")
+        echo("Warnings")
+        echo("")
+        for warning in outcome.warnings:
+            echo(f"{WARN} {warning}")

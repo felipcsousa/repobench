@@ -78,9 +78,16 @@ repobench init              # detect project environment, write repobench.yml
 repobench analyze           # mine merged PRs into eval candidates (no tokens used)
 repobench candidates        # inspect what was found and what was filtered
 repobench benchmark build   # reconstruct + validate tasks, sample a benchmark
+                             #   --reuse-valid skips revalidating tasks that already
+                             #   passed (content-derived ids; --force-revalidate overrides)
+repobench benchmark refresh # re-analyze, report coverage drift, build the next version
 repobench run claude codex glm   # or: repobench run --all
+                             #   --rollouts N adds pass@k / pass^k reliability
+                             #   (cost ×N — shown in the run preview)
 repobench runs              # list recorded runs; --show <id> for per-target detail
 repobench report            # text; --format json | jsonl | csv for CI/dashboards
+repobench compare RUN_A RUN_B   # target regression between two runs of the same
+                             #   benchmark: solve deltas + CI, cost, segments
 repobench clean --runs 5 --apply   # GC old runs/workspaces (dry-run by default)
 ```
 

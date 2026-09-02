@@ -291,8 +291,9 @@ class TestPublicRepository:
         self, fixture_repo: Path, fake_agent_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         storage = _fast_forward(fixture_repo, fake_agent_path, monkeypatch)
+        # build_benchmark lives in cli.builds since wave 2 — patch its binding.
         monkeypatch.setattr(
-            "repobench.cli.services.repository_visibility", lambda slug: "PUBLIC"
+            "repobench.cli.builds.repository_visibility", lambda slug: "PUBLIC"
         )
         # Rebuild so the public-repo flag lands inside the persisted health report.
         built = _invoke("benchmark", "build")
