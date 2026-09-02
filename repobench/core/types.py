@@ -276,6 +276,9 @@ class WorkloadDistribution(BaseModel):
 class AnalyzeSummary(BaseModel):
     total_merged_prs: int = 0
     task_candidates: int = 0
+    # Predates validation (issue #35): analyze only applies the mining hard
+    # filters, so this counts filter-passing candidates — it feeds the
+    # "Candidates passing hard filters" label, never a validation claim.
     validated_candidates: int = 0
     workload: WorkloadDistribution = WorkloadDistribution()
     suggested_benchmark_size: int = 0

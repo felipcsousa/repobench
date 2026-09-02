@@ -375,7 +375,9 @@ def build_benchmark(
         raise UsageError(
             "no valid tasks were produced — nothing to benchmark. "
             f"Rejection codes: {', '.join(codes) or 'unknown'}. "
-            "Check project.test_command in repobench.yml and `repobench candidates`."
+            "Check project.test_command in repobench.yml and `repobench candidates`; "
+            "`repobench candidates --show <PR>` prints each task's validation "
+            "checks with output tails (issue #35)."
         )
 
     requested = size if size is not None else cfg.benchmark.size

@@ -3,6 +3,7 @@ CliRunner — hermetic, no network, no harness binaries required."""
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -173,3 +174,135 @@ def test_candidates_without_analyze_hints_at_analyze(fixture_repo: Path, monkeyp
     result = _invoke("candidates")
     assert result.exit_code == 0
     assert "repobench analyze" in result.output
+
+
+# ------------------------------------------------- build exit codes (issue #35)
+
+
+def _failing_verifier_config(repo: Path) -> None:
+    """A verifier that always fails decisively (exit 1): every candidate must
+    die in validation, so `benchmark build` produces zero tasks."""
+    cfg = RepoBenchConfig()
+    fail_cmd = f'"{sys.executable}" -c "import sys; sys.exit(1)"'
+    cfg.project = ProjectConfig(
+        language="python",
+        test_command=fail_cmd,
+        regression_command=fail_cmd,
+    )
+    cfg.save(repo / "repobench.yml")
+
+
+def _hermetic_verifier_config(repo: Path) -> None:
+    """Point the verifier at the running interpreter's pytest (as the e2e suite
+    does) so validation passes without depending on a PATH pytest."""
+    cfg = RepoBenchConfig()
+    pytest_cmd = f'"{sys.executable}" -m pytest -q'
+    cfg.project = ProjectConfig(
+        language="python",
+        test_command=pytest_cmd,
+        regression_command=pytest_cmd,
+    )
+    cfg.save(repo / "repobench.yml")
+
+
+def test_benchmark_build_with_zero_valid_tasks_exits_one(
+    fixture_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #35 regression: a build that produces nothing must fail loudly —
+    scripts can only detect failure through the exit code."""
+    monkeypatch.chdir(fixture_repo)
+    _failing_verifier_config(fixture_repo)
+    assert _invoke("analyze").exit_code == 0
+    built = _invoke("benchmark", "build")
+    assert built.exit_code == 1, built.output
+    assert "error: no valid tasks were produced" in built.output
+    # the failure points at the per-check diagnostics surface
+    assert "candidates --show" in built.output
+    storage = Storage(fixture_repo / ".repobench" / "state.db")
+    assert storage.list_benchmarks() == []  # nothing was frozen
+
+
+def test_benchmark_build_before_analyze_exits_one(
+    fixture_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(fixture_repo)
+    _write_config(fixture_repo)
+    built = _invoke("benchmark", "build")
+    assert built.exit_code == 1, built.output
+    assert "no task candidates to validate" in built.output
+
+
+def test_benchmark_refresh_without_benchmark_exits_one(
+    fixture_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`benchmark refresh` routes through the same UsageError → exit 1 path."""
+    monkeypatch.chdir(fixture_repo)
+    _write_config(fixture_repo)
+    assert _invoke("analyze").exit_code == 0
+    refreshed = _invoke("benchmark", "refresh")
+    assert refreshed.exit_code == 1, refreshed.output
+    assert "no benchmark found" in refreshed.output
+
+
+# --------------------------------------------- candidates --show (issue #35)
+
+
+def test_candidates_show_prints_per_check_validation(
+    fixture_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(fixture_repo)
+    assert _invoke("init", "--yes").exit_code == 0
+    _hermetic_verifier_config(fixture_repo)
+    assert _invoke("analyze").exit_code == 0
+    built = _invoke("benchmark", "build")
+    assert built.exit_code == 0, built.output
+
+    storage = Storage(fixture_repo / ".repobench" / "state.db")
+    task_rows = storage.tasks_for_pr(7)
+    assert len(task_rows) == 1
+    shown = _invoke("candidates", "--show", "7")
+    assert shown.exit_code == 0, shown.output
+    assert task_rows[0]["task_id"] in shown.output
+    assert "VALID" in shown.output
+    # every recorded check is surfaced with its outcome — no sqlite spelunking
+    for row in storage.validation_history(task_rows[0]["task_id"]):
+        assert row["kind"] in shown.output
+        assert row["result"] in shown.output
+
+
+def test_candidates_show_prints_failed_checks_after_rejected_build(
+    fixture_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(fixture_repo)
+    _failing_verifier_config(fixture_repo)
+    assert _invoke("analyze").exit_code == 0
+    assert _invoke("benchmark", "build").exit_code == 1
+    shown = _invoke("candidates", "--show", "7")
+    assert shown.exit_code == 0, shown.output
+    assert "REJECTED" in shown.output
+    assert "BASELINE_BROKEN" in shown.output
+    assert "failed" in shown.output
+
+
+def test_candidates_show_filtered_pr_shows_mining_rejection(
+    fixture_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(fixture_repo)
+    assert _invoke("init", "--yes").exit_code == 0
+    assert _invoke("analyze").exit_code == 0
+    shown = _invoke("candidates", "--show", "8")  # filtered before packaging
+    assert shown.exit_code == 0, shown.output
+    assert "FILTERED" in shown.output
+    assert "NO_TEST_CHANGE" in shown.output
+    assert Storage(fixture_repo / ".repobench" / "state.db").tasks_for_pr(8) == []
+
+
+def test_candidates_show_unknown_pr_is_a_usage_error(
+    fixture_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(fixture_repo)
+    assert _invoke("init", "--yes").exit_code == 0
+    assert _invoke("analyze").exit_code == 0
+    shown = _invoke("candidates", "--show", "42")
+    assert shown.exit_code == 1, shown.output
+    assert "no candidate recorded for PR #42" in shown.output

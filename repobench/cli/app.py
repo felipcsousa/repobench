@@ -300,6 +300,12 @@ def candidates(
     status: Optional[str] = typer.Option(
         None, help="Filter by status (DISCOVERED / FILTERED / VALID / REJECTED)."
     ),
+    show: Optional[int] = typer.Option(
+        None,
+        "--show",
+        help="Per-check validation diagnostics for one PR's candidate(s), from "
+        "the validation history stored in state.db (issue #35).",
+    ),
 ) -> None:
     """List mined candidates with classification and rejection codes."""
     from repobench.cli import render
@@ -312,6 +318,19 @@ def candidates(
         _fail(str(exc))
         return
     storage = Storage(paths.state_db)
+    if show is not None:
+        rows = storage.candidates_for_pr(show)
+        task_rows = storage.tasks_for_pr(show)
+        if not rows and not task_rows:
+            _fail(f"no candidate recorded for PR #{show} — run `repobench analyze` first")
+            return
+        render.render_pr_diagnostics(
+            show,
+            rows,
+            task_rows,
+            {t["task_id"]: storage.validation_history(t["task_id"]) for t in task_rows},
+        )
+        return
     rows = storage.list_candidates(status)
     if not rows:
         render.echo(

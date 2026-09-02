@@ -6,6 +6,7 @@ task ids may contain characters Rich would otherwise interpret.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -34,7 +35,9 @@ def fail(message: str) -> None:
 
 
 def kv(label: str, value: str) -> None:
-    echo(f"{label:<28}{value}")
+    # The explicit space keeps long labels (>= 28 cols) from abutting the value;
+    # for shorter labels the padding absorbs it and the column is unchanged.
+    echo(f"{label:<27} {value}")
 
 
 def _target_provider(target: ExecutionTarget) -> str:
@@ -77,7 +80,11 @@ def render_analyze_summary(
     if recall_total is not None:
         kv("Recall vs GitHub", _recall_label(outcome.merged_prs, recall_total))
     kv("Potential task candidates", f"{summary.task_candidates}")
-    kv("Validated eval candidates", str(summary.validated_candidates))
+    # Issue #35 honesty fix: analyze never validates anything (that happens in
+    # `benchmark build`), so the label must not claim it. The field name
+    # (`validated_candidates`) predates validation and only counts candidates
+    # that survived the mining hard filters.
+    kv("Candidates passing hard filters", str(summary.validated_candidates))
     echo("")
     echo("Workload")
     echo("")
@@ -153,6 +160,70 @@ def render_candidates_table(candidates: list[CandidateInfo]) -> None:
             candidate.rejection_code.value if candidate.rejection_code else "—",
         )
     console.print(table)
+
+
+def _decode_details(raw: str | None) -> str | None:
+    """The task_validations column is named details_json but predates it:
+    rows store the plain check text (output tails included), never JSON.
+    Decode defensively so either encoding renders honestly (issue #35)."""
+    if raw is None:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        return raw
+    if isinstance(decoded, str):
+        return decoded
+    return json.dumps(decoded, ensure_ascii=False)
+
+
+def render_pr_diagnostics(
+    pr_number: int,
+    candidates: list[CandidateInfo],
+    task_rows: list[dict],
+    history_by_task: dict[str, list[dict]],
+) -> None:
+    """`candidates --show <PR>` (issue #35): why a PR became what it is.
+    Filtered before packaging → the mining rejection code; otherwise each
+    task's task_validations log (check, outcome, details with output tails) —
+    the diagnostics that used to require opening state.db by hand."""
+
+    def status_line(candidate: CandidateInfo) -> str:
+        line = candidate.status.value
+        if candidate.rejection_code is not None:
+            line += f" · rejection {candidate.rejection_code.value}"
+        return line
+
+    header = f"Candidate PR #{pr_number}"
+    if len(candidates) == 1:
+        header += f" — {status_line(candidates[0])}"
+    echo(header)
+    echo("")
+    if not candidates:
+        echo("(no candidate row recorded for this PR)")
+    elif len(candidates) > 1:
+        for candidate in candidates:
+            echo(f"  {status_line(candidate)}")
+        echo("")
+    if not task_rows:
+        echo("No tasks were packaged for this PR — it was filtered during mining,")
+        echo("before validation ran.")
+        return
+    for index, row in enumerate(task_rows):
+        if index:
+            echo("")
+        echo(f"Task {row['task_id']} (version {row['version']}) — {row['status']}")
+        checks = history_by_task.get(row["task_id"], [])
+        if not checks:
+            echo("  (no validation checks recorded)")
+            continue
+        for check in checks:
+            mark = {"passed": OK, "failed": MISS}.get(check["result"], "·")
+            echo(f"  {mark} {check['kind']:<16}{check['result']}")
+            details = _decode_details(check["details_json"])
+            if details:
+                for detail_line in details.splitlines() or [""]:
+                    echo(f"      {detail_line}")
 
 
 def _target_pricing_label(target: ExecutionTarget, cfg: RepoBenchConfig) -> str:
