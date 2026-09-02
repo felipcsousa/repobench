@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import shlex
+import sys
 from pathlib import Path
 
 import yaml
@@ -167,20 +169,25 @@ def detect_project_environment(repo: Path) -> ProjectConfig:
     )
     has_node = (repo / "package.json").exists()
 
+    # Detected Python commands use the interpreter running RepoBench: a bare
+    # "python" does not exist on many systems (macOS ships python3 only), and a
+    # dead suggestion rejects every task with ENVIRONMENT_UNSUPPORTED at build.
+    py = shlex.quote(sys.executable)
+
     if (repo / "uv.lock").exists():
         cfg.language, cfg.package_manager = "python", "uv"
         cfg.install_command = "uv sync --frozen"
-        cfg.test_command = "python -m pytest"
+        cfg.test_command = f"{py} -m pytest"
         cfg.regression_command = cfg.test_command
     elif (repo / "poetry.lock").exists():
         cfg.language, cfg.package_manager = "python", "poetry"
         cfg.install_command = "poetry install"
-        cfg.test_command = "python -m pytest"
+        cfg.test_command = f"{py} -m pytest"
         cfg.regression_command = cfg.test_command
     elif has_python:
         cfg.language, cfg.package_manager = "python", "pip"
-        cfg.install_command = "python -m pip install -e ."
-        cfg.test_command = "python -m pytest"
+        cfg.install_command = f"{py} -m pip install -e ."
+        cfg.test_command = f"{py} -m pytest"
         cfg.regression_command = cfg.test_command
     elif (repo / "pnpm-lock.yaml").exists():
         cfg.language, cfg.package_manager = "javascript-typescript", "pnpm"
