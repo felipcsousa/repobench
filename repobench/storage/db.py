@@ -198,6 +198,11 @@ class Storage:
             rows = self.query("SELECT data_json FROM tasks")
         return [json.loads(r["data_json"]) for r in rows]
 
+    def task_ids_with_status(self, status: str) -> list[str]:
+        """Task ids holding a status — reuse lookups (issue #16) need no data_json."""
+        rows = self.query("SELECT task_id FROM tasks WHERE status = ?", (status,))
+        return [r["task_id"] for r in rows]
+
     def save_validation(
         self, task_id: str, kind: str, result: str, details_json: str | None = None
     ) -> None:

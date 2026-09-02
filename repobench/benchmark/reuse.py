@@ -48,14 +48,11 @@ def reusable_task_ids(storage: Storage, paths: ProjectPaths) -> set[str]:
     """Task ids eligible for validation reuse (issue #16): status VALID in the
     tasks table AND a package that still loads from disk. Pool membership is
     enforced separately by the build loop, which iterates candidates only."""
-    eligible: set[str] = set()
-    rows = storage.query(
-        "SELECT task_id FROM tasks WHERE status = ?", (TaskStatus.VALID.value,)
-    )
-    for row in rows:
-        if package_loads(paths, row["task_id"]):
-            eligible.add(row["task_id"])
-    return eligible
+    return {
+        task_id
+        for task_id in storage.task_ids_with_status(TaskStatus.VALID.value)
+        if package_loads(paths, task_id)
+    }
 
 
 def reused_validation_report(task_id: str) -> TaskValidationReport:

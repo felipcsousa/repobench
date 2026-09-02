@@ -390,12 +390,8 @@ def build_compare(
     rates pool all targets of a run per segment and cover only segments present
     in both runs. Fingerprint and task-set drift become warnings — never abort.
     """
-    run_a = storage.get_run(run_a_id)
-    if run_a is None:
-        raise UsageError(f"unknown run: {run_a_id}")
-    run_b = storage.get_run(run_b_id)
-    if run_b is None:
-        raise UsageError(f"unknown run: {run_b_id}")
+    run_a = _resolve_run(storage, run_a_id)
+    run_b = _resolve_run(storage, run_b_id)
 
     benchmark_a = run_a.get("benchmark_id")
     benchmark_b = run_b.get("benchmark_id")
