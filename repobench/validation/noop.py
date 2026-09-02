@@ -25,6 +25,11 @@ SPEC = CheckSpec(
     apply_verifier=True,
     invert=True,  # decisive exit 1 means the check PASSED
     fail_code=RejectionCode.NOOP_PASSES,
+    pass_description="hidden verifier fails on BASE as required",
+    fail_description=(
+        "hidden verifier passed on the unmodified base; it must fail "
+        "without the gold solution (PRD §78)"
+    ),
 )
 
 

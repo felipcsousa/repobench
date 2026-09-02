@@ -11,6 +11,7 @@ import shutil
 import tarfile
 from pathlib import Path
 
+from repobench.core.errors import RepoBenchError
 from repobench.core.testpaths import is_test_path
 from repobench.execution.process import run_sync
 
@@ -60,8 +61,16 @@ class WorkspaceManager:
         if repo_dir.exists():
             shutil.rmtree(repo_dir)
         repo_dir.mkdir(parents=True)
-        with tarfile.open(base_archive) as tar:
-            tar.extractall(repo_dir, filter="data")
+        try:
+            with tarfile.open(base_archive) as tar:
+                tar.extractall(repo_dir, filter="data")
+        except tarfile.TarError as exc:
+            # Issue #33: a corrupt/empty base archive is a typed failure, never a
+            # raw tarfile traceback (the reconstruction guard normally keeps this
+            # from ever seeing an empty tree).
+            raise RepoBenchError(
+                f"base archive {base_archive} is not a readable tar: {exc}"
+            ) from exc
         _init_synthetic_git(repo_dir)
         return Workspace(trial_id=trial_id, task_id=task_id, repo_dir=repo_dir, base_dir=trial_dir)
 

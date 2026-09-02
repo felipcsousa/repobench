@@ -10,7 +10,17 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from tests.fixtures.gitutil import TEST_MULTIPLY, build_repo, make_candidate
+from tests.fixtures.gitutil import (
+    CALCULATOR_BUGGY,
+    CALCULATOR_FIXED,
+    TEST_CALC,
+    TEST_MULTIPLY,
+    build_repo,
+    commit_all,
+    git,
+    make_candidate,
+    merge_pr,
+)
 from repobench.config import ProjectConfig
 from repobench.core.types import (
     RejectionCode,
@@ -19,6 +29,7 @@ from repobench.core.types import (
 )
 from repobench.tasks.leakage import LeakageReport
 from repobench.tasks.reconstruction import build_task_package
+from repobench.validation._shared import CheckSpec, _run_spec, get_regression_command
 from repobench.validation.baseline import check_baseline
 from repobench.validation.determinism import check_determinism
 from repobench.validation.noop import check_noop
@@ -264,12 +275,39 @@ def test_check_spawn_failure_is_inconclusive(tmp_path: Path) -> None:
 # ----------------------------------------------------------------- regression
 
 
+# The pre-fix regression spec (issue #32): gold WITHOUT the hidden verifier.
+GOLD_ONLY_SPEC = CheckSpec(
+    name="regression",
+    command_getter=get_regression_command,
+    apply_gold=True,
+    fail_code=RejectionCode.GOLD_REGRESSION,
+    pass_description="gold passes the regression command",
+    fail_description="gold breaks the regression command",
+)
+
+# Root-level BASE test documenting the buggy sum_even behavior (== 4); the PR then
+# fixes the bug and rewrites the expectation to == 6, so the change lands in the
+# hidden verifier patch.
+STALE_SUM_EVEN_TEST = '''import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from calculator import sum_even
+
+
+def test_sum_even_sums_the_evens():
+    assert sum_even([1, 2, 3, 4]) == 4
+'''
+
+
 def test_check_regression_passes_with_gold(tmp_path: Path) -> None:
     task = make_task(tmp_path)
     project = make_project(regression_command=PYTEST_CMD)
     result = check_regression(task, project, workspaces_root=tmp_path / "ws")
     assert result.passed is True
     assert result.code is None
+    assert "regression command" in result.details  # regression wording, not oracle's
 
 
 def test_check_regression_gold_regression(tmp_path: Path) -> None:
@@ -280,12 +318,57 @@ def test_check_regression_gold_regression(tmp_path: Path) -> None:
     result = check_regression(task, project, workspaces_root=tmp_path / "ws")
     assert result.passed is False
     assert result.code == RejectionCode.GOLD_REGRESSION
+    assert "regression command" in result.details
+
+
+def test_check_regression_accepts_pr_updated_test_expectations(tmp_path: Path) -> None:
+    # Issue #32: the PR fixes sum_even and updates the existing test's expected
+    # value — a legitimate change that lives in the hidden verifier patch. Gold
+    # alone trips the stale BASE expectation (the old GOLD_REGRESSION bug); the
+    # regression check runs gold + the PR's test changes and must PASS.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "--quiet", "--initial-branch=main")
+    (repo / "calculator.py").write_text(CALCULATOR_BUGGY)
+    (repo / "test_calc.py").write_text(TEST_CALC)
+    (repo / "test_sum_even.py").write_text(STALE_SUM_EVEN_TEST)
+    base_sha = commit_all(repo, "initial commit")
+    branch = "feat/fix-sum-even"
+    git(repo, "checkout", "--quiet", "-b", branch)
+    (repo / "calculator.py").write_text(CALCULATOR_FIXED)
+    (repo / "test_sum_even.py").write_text(STALE_SUM_EVEN_TEST.replace("== 4", "== 6"))
+    head_sha = commit_all(repo, "fix sum_even, update the test expectation")
+    merge_sha = merge_pr(repo, 12, branch)
+    task = build_task_package(
+        repo,
+        make_candidate(
+            {
+                "repo": repo,
+                "number": 12,
+                "base_sha": base_sha,
+                "head_sha": head_sha,
+                "merge_sha": merge_sha,
+            }
+        ),
+        tmp_path / "pkg",
+    )
+
+    project = make_project(regression_command=PYTEST_CMD)
+    # Premise: gold without the PR's test changes fails on the stale expectation.
+    stale = _run_spec(task, project, GOLD_ONLY_SPEC, workspaces_root=tmp_path / "ws")
+    assert stale.passed is False
+    assert stale.code == RejectionCode.GOLD_REGRESSION
+
+    result = check_regression(task, project, workspaces_root=tmp_path / "ws")
+    assert result.passed is True
+    assert result.code is None
 
 
 def test_check_regression_skipped_without_command(tmp_path: Path) -> None:
     task = make_task(tmp_path)
     result = check_regression(task, make_project(), workspaces_root=tmp_path / "ws")
     assert result.passed is None
+    assert "regression_command" in result.details  # not test_command
 
 
 # ---------------------------------------------------------------- determinism

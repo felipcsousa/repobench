@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from repobench.core import gitutil
+from repobench.core.errors import ReconstructionError
 from repobench.core.ids import new_task_id
 from repobench.core.types import CandidateInfo, TaskMetadata, TaskPackage, TaskStatus
 from repobench.tasks.instruction import render_instruction
@@ -19,8 +20,8 @@ from repobench.tasks.verifier import split_diff
 def build_task_package(repo: Path, candidate: CandidateInfo, out_dir: Path) -> TaskPackage:
     """Build a full task package for `candidate` into `out_dir`.
 
-    Raises RuntimeError when the history is not reconstructable (missing SHAs or
-    `git archive` failure).
+    Raises ReconstructionError when the history is not reconstructable (missing
+    SHAs, an empty-tree base, or `git archive` failure).
     """
     repo = Path(repo)
     out_dir = Path(out_dir)
@@ -30,14 +31,24 @@ def build_task_package(repo: Path, candidate: CandidateInfo, out_dir: Path) -> T
     base_sha = pr.base_sha
     gold_sha = pr.merge_sha
     if not base_sha or not gold_sha:
-        raise RuntimeError(
+        raise ReconstructionError(
             f"candidate {candidate.candidate_id} has no base/merge SHA; "
             "history not reconstructable"
         )
 
+    # Issue #33: a PR based on the initial commit has an empty-tree parent side;
+    # `git archive` of it yields a 0-entry tar that kills the build downstream.
+    # Reject the candidate here, before any archive exists.
+    if gitutil.tree_is_empty(repo, base_sha):
+        raise ReconstructionError(
+            f"candidate {candidate.candidate_id} (PR #{pr.number}): base "
+            f"{base_sha} has an empty tree — the PR adds the whole repository "
+            "and cannot become a task; history not reconstructable"
+        )
+
     base_tar = out_dir / "base.tar"
     if not gitutil.archive_commit(repo, base_sha, base_tar):
-        raise RuntimeError(
+        raise ReconstructionError(
             f"git archive of {base_sha} failed in {repo}; history not reconstructable"
         )
 

@@ -246,3 +246,50 @@ def make_candidate(fx: dict) -> CandidateInfo:
             test_files=1,
         ),
     )
+
+
+def build_empty_base_repo(root: Path, *, number: int = 11) -> dict:
+    """Repository whose first mined PR adds the whole repository (issue #33): the
+    merge base is the initial commit, whose tree is empty, so its side of the PR
+    diff is everything. A second, healthy PR fixes sum_even on top, mirroring
+    `build_repo`. Returns {"repo", "empty_fx", "healthy_fx"} where both fx dicts
+    match the `make_candidate` shape."""
+    repo = root / "repo"
+    repo.mkdir(parents=True)
+    git(repo, "init", "--quiet", "--initial-branch=main")
+    git(repo, "commit", "--quiet", "--no-gpg-sign", "--allow-empty", "-m", "initial commit")
+    empty_base = git(repo, "rev-parse", "HEAD")
+
+    # PR #<number>: adds the whole repository — base is the empty-tree initial commit.
+    branch = f"feat/add-repo-{number}"
+    git(repo, "checkout", "--quiet", "-b", branch)
+    (repo / "calculator.py").write_text(CALCULATOR_BUGGY)
+    (repo / "test_calc.py").write_text(TEST_CALC)
+    (repo / "README.md").write_text(CALC_README)
+    (repo / "pyproject.toml").write_text(PYPROJECT)
+    empty_head = commit_all(repo, "add the calculator project")
+    empty_merge = merge_pr(repo, number, branch)
+
+    # PR #<number+1>: the usual healthy bugfix (its base tree is no longer empty).
+    fix_branch = f"feat/fix-{number + 1}"
+    git(repo, "checkout", "--quiet", "-b", fix_branch)
+    (repo / "calculator.py").write_text(CALCULATOR_FIXED)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_sum_even.py").write_text(TEST_SUM_EVEN)
+    healthy_head = commit_all(repo, "sum_even returns incorrect totals for mixed input")
+    healthy_merge = merge_pr(repo, number + 1, fix_branch)
+
+    def fx(n: int, base_sha: str, head_sha: str, merge_sha: str) -> dict:
+        return {
+            "repo": repo,
+            "number": n,
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "merge_sha": merge_sha,
+        }
+
+    return {
+        "repo": repo,
+        "empty_fx": fx(number, empty_base, empty_head, empty_merge),
+        "healthy_fx": fx(number + 1, empty_merge, healthy_head, healthy_merge),
+    }
