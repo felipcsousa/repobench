@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS trials(
   benchmark_id TEXT,
   task_id TEXT,
   target_id TEXT,
+  rollout INTEGER DEFAULT 1,
   outcome TEXT,
   data_json TEXT,
   created_at TEXT
@@ -97,6 +98,19 @@ class Storage:
     def init_schema(self) -> None:
         with closing(self.connect()) as conn, conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """In-place migrations for databases created by older versions.
+
+        Issue #13: trials.rollout was added in wave 2; databases from before it
+        keep working through the DEFAULT 1 backfill (data_json stays the source
+        of truth for reads).
+        """
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(trials)")}
+        if "rollout" not in columns:
+            conn.execute("ALTER TABLE trials ADD COLUMN rollout INTEGER DEFAULT 1")
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -269,6 +283,7 @@ class Storage:
             "benchmark_id": trial.benchmark_id,
             "task_id": trial.task_id,
             "target_id": trial.target_id,
+            "rollout": trial.rollout,
             "outcome": trial.outcome.value,
             "data_json": trial.model_dump_json(),
             "created_at": utcnow().isoformat(),

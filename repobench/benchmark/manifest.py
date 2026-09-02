@@ -72,3 +72,22 @@ def save_manifest(manifest: BenchmarkManifest, directory: Path) -> Path:
 def load_manifest(directory: Path) -> BenchmarkManifest:
     path = Path(directory) / MANIFEST_FILENAME
     return BenchmarkManifest.model_validate_json(path.read_text())
+
+
+def load_stored_manifest(row: dict) -> BenchmarkManifest | None:
+    """Manifest from a benchmarks-table row, or None when absent/unreadable
+    (issue #15). Rows store the manifest.json FILE path while load_manifest
+    takes the directory — both shapes are accepted here; a missing or corrupt
+    manifest degrades to None so callers can fail with a polite error."""
+    raw = row.get("manifest_path") if row else None
+    if not raw:
+        return None
+    path = Path(raw)
+    if path.is_file():
+        path = path.parent
+    if not (path / MANIFEST_FILENAME).is_file():
+        return None
+    try:
+        return load_manifest(path)
+    except Exception:
+        return None

@@ -289,6 +289,9 @@ class TrialResult(BaseModel):
     benchmark_id: str | None = None
     task_id: str
     target_id: str
+    # 1-indexed rollout within the run (issue #13); default keeps every row
+    # written before multi-rollout runs valid.
+    rollout: int = 1
     harness: str | None = None
     harness_version: str | None = None
     model: str | None = None

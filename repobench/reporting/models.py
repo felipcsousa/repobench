@@ -9,6 +9,7 @@ import pydantic
 from repobench.analysis.metrics import SegmentStat, TargetMetrics
 from repobench.analysis.pareto import ParetoResult
 from repobench.analysis.recommendation import Recommendation
+from repobench.analysis.reliability import TargetReliability
 from repobench.benchmark.health import HealthReport
 from repobench.core.types import utcnow
 
@@ -53,6 +54,9 @@ class ReportData(pydantic.BaseModel):
     segments: dict[str, dict[str, dict[str, SegmentStat]]]
     # Tier-D instruction generation success/fallback across the benchmark
     instruction_generation: InstructionGenerationStats | None = None
+    # Per-target multi-rollout reliability (issue #13); None for runs that only
+    # ever used a single rollout per task.
+    reliability: dict[str, TargetReliability] | None = None
     warnings: list[str]
     concurrency: int | None
     # Stored bootstrap seed (PRD §104: "com seed armazenada") so the run's

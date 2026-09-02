@@ -4,9 +4,9 @@ Commands stay thin: each one delegates to a function here, so tests (and the
 e2e suite) can drive exactly the same code paths as the CLI. Persistence lives
 at this layer only — the domain modules stay pure (PRD §114).
 
-Scope: project layout/init, analyze, benchmark build, run planning/execution.
-Report assembly lives in cli.reports; run inspection and .repobench/ GC in
-cli.maintenance.
+Scope: project layout/init, analyze, and run planning/execution. Benchmark
+construction lives in cli.builds; report assembly in cli.reports; run
+inspection and .repobench/ GC in cli.maintenance.
 """
 
 from __future__ import annotations
@@ -16,27 +16,20 @@ import json
 import logging
 import shlex
 import shutil
-import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
-from repobench.benchmark.coverage import CoverageReport, coverage_report
-from repobench.benchmark.health import HealthReport, compute_health
-from repobench.benchmark.manifest import build_manifest, save_manifest
-from repobench.benchmark.sampling import greedy_stratified_sample
 from repobench.config import RepoBenchConfig, default_config_for
 from repobench.core.errors import UsageError
-from repobench.core.ids import new_run_id, new_task_id
+from repobench.core.ids import new_run_id
 from repobench.core.paths import ProjectPaths, find_repo_root
 from repobench.core.types import (
     AnalyzeSummary,
     CandidateInfo,
     ExecutionTarget,
     PRInfo,
-    RejectionCode,
-    TaskMetadata,
     TaskPackage,
     TaskStatus,
     TrialOutcome,
@@ -50,17 +43,8 @@ from repobench.mining.candidates import mine_candidates
 from repobench.mining.subsystem import detect_package_dirs, load_codeowners
 from repobench.repository.git import GitRepo
 from repobench.repository.github import GitHubClient
-from repobench.repository.workload import (
-    build_workload,
-    suggest_benchmark_size,
-    summarize_analysis,
-)
+from repobench.repository.workload import suggest_benchmark_size, summarize_analysis
 from repobench.storage.db import Storage
-from repobench.tasks.generation import generate_instruction
-from repobench.tasks.instruction import render_instruction
-from repobench.tasks.leakage import LeakageReport, scan_base_archive
-from repobench.tasks.reconstruction import build_task_package
-from repobench.validation.pipeline import TaskValidator, TaskValidationReport
 
 CONFIG_FILENAME = "repobench.yml"
 
@@ -229,310 +213,6 @@ def persist_candidates(storage: Storage, candidates: list[CandidateInfo]) -> Non
         storage.save_candidate(candidate)
 
 
-# ------------------------------------------------------------ benchmark build
-
-
-@dataclass
-class TaskBuildResult:
-    candidate: CandidateInfo
-    package: TaskPackage
-    leakage: LeakageReport
-    report: TaskValidationReport
-
-    @property
-    def status(self) -> TaskStatus:
-        return self.report.status
-
-    @property
-    def rejection_code(self) -> RejectionCode | None:
-        return self.report.rejection_code
-
-    @property
-    def checks_passed(self) -> int:
-        return sum(1 for c in self.report.checks if c.passed is True)
-
-    @property
-    def checks_total(self) -> int:
-        return sum(1 for c in self.report.checks if c.passed is not None)
-
-
-@dataclass
-class BenchmarkBuildOutcome:
-    benchmark_id: str
-    manifest_path: Path
-    requested_size: int
-    valid: list[TaskBuildResult]
-    rejected: list[TaskBuildResult]
-    sample: list[TaskMetadata]
-    coverage: CoverageReport
-    health: HealthReport
-    instruction_tiers: dict[str, int] = field(default_factory=dict)
-
-
-def _package_for(repo: GitRepo, candidate: CandidateInfo, paths: ProjectPaths) -> TaskPackage:
-    pr = candidate.pr
-    task_id = new_task_id(pr.number, pr.base_sha, pr.merge_sha)
-    return build_task_package(repo.root, candidate, paths.task_dir(task_id))
-
-
-def _resolve_generation_target(cfg: RepoBenchConfig) -> ExecutionTarget | None:
-    """The tier-D generation target when enabled, else None (UsageError when misconfigured)."""
-    gen_cfg = cfg.instruction_generation
-    if not gen_cfg.enabled:
-        return None
-    if gen_cfg.target not in cfg.targets:
-        configured = ", ".join(sorted(cfg.targets)) or "none"
-        raise UsageError(
-            "instruction_generation.enabled requires instruction_generation.target "
-            f"to reference a configured target in {CONFIG_FILENAME}; got "
-            f"{gen_cfg.target!r} (configured: {configured})"
-        )
-    target = cfg.targets[gen_cfg.target]
-    validate_targets([target])  # structural only — fails fast on a broken command template
-    return target
-
-
-def _apply_instruction_generation(
-    repo: GitRepo,
-    candidate: CandidateInfo,
-    package: TaskPackage,
-    target: ExecutionTarget,
-    cfg: RepoBenchConfig,
-    harness_version: str | None,
-    log: ProgressFn | None,
-) -> CandidateInfo:
-    """Tier-D generation for candidates whose instruction is title-derived (source
-    None or "title"); A/B candidates already carry pre-solution intent.
-
-    Success: the candidate is upgraded to confidence D / source "llm" and the
-    package's instruction.md + metadata.json are rewritten (metadata gains a
-    `generation` extras block) so `_persist_validation` stores the new assessment.
-    Failure (spawn/validator): the title-derived instruction is kept as-is, a
-    `generation_failed` extras block records the reason, and validation proceeds.
-    """
-    if candidate.assessment.instruction_source not in (None, "title"):
-        return candidate
-
-    outcome = generate_instruction(
-        candidate,
-        package,
-        target,
-        cfg=cfg.instruction_generation,
-        harness_version=harness_version,
-    )
-
-    if outcome.text is None:
-        package.metadata.generation_failed = {
-            "reason": outcome.failed_reason,
-            "violations": outcome.violations,
-            "attempts": outcome.attempts,
-        }
-        package.metadata_json.write_text(package.metadata.model_dump_json(indent=2))
-        if log is not None:
-            reason = outcome.failed_reason or "; ".join(outcome.violations) or "unknown"
-            log(
-                f"PR #{candidate.pr.number}: instruction generation failed ({reason}); "
-                "keeping the title-derived instruction"
-            )
-        return candidate
-
-    assessment = candidate.assessment.model_copy(
-        update={
-            "instruction": outcome.text,
-            "instruction_confidence": "D",
-            "instruction_source": "llm",
-        }
-    )
-    candidate = candidate.model_copy(update={"assessment": assessment})
-    package.metadata.assessment = assessment
-    package.metadata.generation = {**outcome.metadata, "attempts": outcome.attempts}
-    package.instruction_md.write_text(
-        render_instruction(candidate, repo_name=repo.root.name)
-    )
-    package.metadata_json.write_text(package.metadata.model_dump_json(indent=2))
-    return candidate
-
-
-def _persist_validation(
-    storage: Storage, candidate: CandidateInfo, result: TaskBuildResult
-) -> None:
-    package = result.package
-    storage.save_task(
-        package.task_id,
-        data=package.metadata.model_dump(mode="json"),
-        candidate_id=candidate.candidate_id,
-        status=result.status.value,
-        package_path=str(package.directory),
-    )
-    for check in result.report.checks:
-        outcome = {True: "passed", False: "failed", None: "skipped"}[check.passed]
-        storage.save_validation(package.task_id, check.name, outcome, check.details or None)
-    storage.save_candidate(
-        candidate.model_copy(
-            update={"status": result.status, "rejection_code": result.rejection_code}
-        )
-    )
-
-
-def build_benchmark(
-    root: Path,
-    cfg: RepoBenchConfig,
-    storage: Storage,
-    *,
-    size: int | None = None,
-    log: ProgressFn | None = None,
-) -> BenchmarkBuildOutcome:
-    """Validate candidate tasks, sample a representative benchmark (PRD §88-89, §126)."""
-    paths = project_paths(root)
-    repo = GitRepo(root)
-    candidates = storage.list_candidates()
-    pool = [c for c in candidates if c.status is not TaskStatus.FILTERED]
-    if not pool:
-        raise UsageError(
-            "no task candidates to validate — run `repobench analyze` first"
-        )
-
-    # Tier pool filter (generalizes the old confidence-C knob): an explicit
-    # allowed_confidences list restricts the pool BEFORE any validation work.
-    allowed_confidences = cfg.benchmark.allowed_confidences
-    if allowed_confidences is not None:
-        pool = [
-            c for c in pool if c.assessment.instruction_confidence in allowed_confidences
-        ]
-        if not pool:
-            raise UsageError(
-                "no task candidates match benchmark.allowed_confidences "
-                f"{allowed_confidences} — nothing to benchmark"
-            )
-
-    # Tier-D generation (opt-in): spends real tokens, so it only ever runs here
-    # in `benchmark build` — analyze stays token-free (PRD §10).
-    generation_target = _resolve_generation_target(cfg)
-    harness_version: str | None = None
-    if generation_target is not None:
-        harness_version = get_adapter(generation_target.harness).version()
-        if log is not None:
-            log(
-                f"instruction generation enabled (target: {generation_target.id}, "
-                f"harness: {generation_target.harness})"
-            )
-
-    validator = TaskValidator(cfg.project, workspaces_root=paths.workspaces_dir)
-    results: list[TaskBuildResult] = []
-    for candidate in pool:
-        package = _package_for(repo, candidate, paths)
-        if generation_target is not None:
-            candidate = _apply_instruction_generation(
-                repo,
-                candidate,
-                package,
-                generation_target,
-                cfg,
-                harness_version,
-                log,
-            )
-        leakage = scan_base_archive(package.metadata, package.base_tar)
-        report = validator.validate(package, leakages=leakage)
-        result = TaskBuildResult(
-            candidate=candidate, package=package, leakage=leakage, report=report
-        )
-        package.metadata.status = report.status
-        package.metadata.rejection_code = report.rejection_code
-        package.metadata_json.write_text(package.metadata.model_dump_json(indent=2))
-        _persist_validation(storage, candidate, result)
-        results.append(result)
-        if log is not None:
-            pr = candidate.pr.number
-            code = f" ({result.rejection_code.value})" if result.rejection_code else ""
-            log(f"PR #{pr}: {result.status.value}{code}")
-
-    valid = [r for r in results if r.status is TaskStatus.VALID]
-    if not valid:
-        codes = ", ".join(
-            sorted({r.rejection_code.value for r in results if r.rejection_code})
-        )
-        raise UsageError(
-            "no valid tasks were produced — nothing to benchmark. "
-            f"Rejection codes: {codes or 'unknown'}. "
-            "Check project.test_command in repobench.yml and `repobench candidates`."
-        )
-
-    requested = size if size is not None else cfg.benchmark.size
-    metadatas = [r.package.metadata for r in valid]
-    sample = greedy_stratified_sample(metadatas, requested, cfg.benchmark.dimensions)
-
-    universe = build_workload(candidates)  # the full Workload Universe (PRD §66)
-    coverage = coverage_report(universe, sample, cfg.benchmark.dimensions)
-
-    total_checks = sum(r.checks_total for r in results)
-    passed_ratio = (
-        sum(r.checks_passed for r in results) / total_checks if total_checks else 0.0
-    )
-    sample_ids = {meta.task_id for meta in sample}
-    sampled_valid = [r for r in valid if r.package.task_id in sample_ids]
-    leakage_score = (
-        round(statistics.mean(r.leakage.score for r in sampled_valid))
-        if sampled_valid
-        else 0
-    )
-    universe_counts: dict[str, int] = {}
-    for candidate in candidates:
-        key = candidate.assessment.task_type.value
-        universe_counts[key] = universe_counts.get(key, 0) + 1
-
-    health = compute_health(
-        coverage=coverage,
-        all_checks_passed_ratio=passed_ratio,
-        leakage_score=leakage_score,
-        tasks=sample,
-        universe_counts=universe_counts,
-        lookback_days=cfg.repository.lookback_days,
-        public_repository=repository_visibility(repo.remote_slug) == "PUBLIC",
-    )
-
-    manifest = build_manifest(
-        sample,
-        health,
-        coverage,
-        cfg.benchmark,
-        repository=repo.remote_slug,
-    )
-    manifest_path = save_manifest(manifest, paths.benchmark_dir(manifest.benchmark_id))
-    storage.save_benchmark(
-        manifest.benchmark_id,
-        size=len(sample),
-        health_json=health.model_dump_json(),
-        manifest_path=str(manifest_path),
-        methodology_version=manifest.methodology_version,
-    )
-    for position, meta in enumerate(sample):
-        storage.save_benchmark_task(manifest.benchmark_id, meta.task_id, position)
-
-    # Instruction tier mix of the sample (PRD §71-72): D tasks are derived from
-    # the solution by construction, so their presence is always called out.
-    instruction_tiers: dict[str, int] = {}
-    for meta in sample:
-        tier = meta.assessment.instruction_confidence
-        instruction_tiers[tier] = instruction_tiers.get(tier, 0) + 1
-    if instruction_tiers and log is not None:
-        tier_line = " ".join(
-            f"{tier}×{count}" for tier, count in sorted(instruction_tiers.items())
-        )
-        log(f"Instruction tiers: {tier_line}")
-
-    return BenchmarkBuildOutcome(
-        benchmark_id=manifest.benchmark_id,
-        manifest_path=manifest_path,
-        requested_size=requested,
-        valid=valid,
-        rejected=[r for r in results if r.status is not TaskStatus.VALID],
-        sample=sample,
-        coverage=coverage,
-        health=health,
-        instruction_tiers=instruction_tiers,
-    )
-
-
 # ------------------------------------------------------------------------ run
 
 
@@ -646,13 +326,16 @@ class RunPlan:
     benchmark_id: str
     tasks: list[TaskPackage]
     targets: list[ExecutionTarget]
-    pairs: list[tuple[TaskPackage, ExecutionTarget]]
+    # (task, target, rollout) triples — rollout expansion happens here in the
+    # planner, so run_matrix stays a dumb bounded-concurrency executor (issue #13).
+    pairs: list[tuple[TaskPackage, ExecutionTarget, int]]
     jobs: int
     timeout_minutes: int
     keep_workspaces: bool
     is_resume: bool
     already_complete: int
     retried: int = 0
+    rollouts: int = 1
 
 
 # Outcomes a plain --resume retries: infrastructure/transient failures, never a
@@ -677,8 +360,12 @@ def plan_run(
     retry_failed: bool = False,
     jobs: int | None = None,
     keep: bool | None = None,
+    rollouts: int = 1,
 ) -> RunPlan:
-    """Resolve benchmark, tasks and the exact Task×Target pairs to execute (PRD §96, §99)."""
+    """Resolve benchmark, tasks and the exact (Task, Target, rollout) triples to
+    execute (PRD §96, §99; multi-rollout expansion per issue #13)."""
+    if rollouts < 1:
+        raise UsageError(f"--rollouts must be at least 1, got {rollouts}")
     if resume:
         runs = storage.list_runs()
         if not runs:
@@ -699,26 +386,31 @@ def plan_run(
     jobs_eff = jobs if jobs is not None else cfg.execution.jobs
     keep_eff = keep if keep is not None else cfg.execution.keep_workspaces
 
-    existing: dict[tuple[str, str], TrialResult] = {}
+    existing: dict[tuple[str, str, int], list[TrialResult]] = {}
     if is_resume:
         for trial in storage.list_trials(run_id):
-            existing[(trial.task_id, trial.target_id)] = trial
+            existing.setdefault((trial.task_id, trial.target_id, trial.rollout), []).append(
+                trial
+            )
 
     retryable = set(_RETRYABLE_OUTCOMES)
     if retry_failed:
         retryable.add(TrialOutcome.UNSOLVED)
-    pairs: list[tuple[TaskPackage, ExecutionTarget]] = []
+    pairs: list[tuple[TaskPackage, ExecutionTarget, int]] = []
     already_complete = 0
     retried = 0
     for task in tasks:
         for target in targets:
-            previous = existing.get((task.task_id, target.id))
-            if previous is None or previous.outcome in retryable:
-                if previous is not None:
+            for rollout in range(1, rollouts + 1):
+                previous = existing.get((task.task_id, target.id, rollout), [])
+                # A rollout is already complete iff a stored trial settled it
+                # with a non-retryable verdict (issue #13).
+                if any(trial.outcome not in retryable for trial in previous):
+                    already_complete += 1
+                    continue
+                if previous:
                     retried += 1
-                pairs.append((task, target))
-            else:
-                already_complete += 1
+                pairs.append((task, target, rollout))
 
     return RunPlan(
         run_id=run_id,
@@ -732,6 +424,7 @@ def plan_run(
         is_resume=is_resume,
         already_complete=already_complete,
         retried=retried,
+        rollouts=rollouts,
     )
 
 
@@ -822,6 +515,7 @@ def execute_plan(
             "keep_workspaces": plan.keep_workspaces,
             "bootstrap_seed": bootstrap_seed,
             "targets": [t.id for t in plan.targets],
+            "rollouts": plan.rollouts,
         }
     )
     if plan.is_resume:

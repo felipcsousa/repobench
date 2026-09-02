@@ -377,7 +377,7 @@ async def test_run_matrix_jobs_one_returns_full_matrix_in_order(tmp_path: Path) 
     noop = _write_agent(tmp_path, "noop_matrix.py", NOOP_AGENT)
     executor = _executor(tmp_path)
     targets = [_command_target("solver", fix_agent), _command_target("noop", noop)]
-    pairs = [(task, target) for task in tasks for target in targets]
+    pairs = [(task, target, 1) for task in tasks for target in targets]
 
     progress: list = []
     results = await run_matrix(
@@ -469,7 +469,7 @@ def _timing_pair_setup(tmp_path: Path):
     executor = _executor(
         tmp_path, project_cfg=ProjectConfig(test_command=f'"{sys.executable}" -c "import sys; sys.exit(1)"')
     )
-    pairs = [(task_a, targets[0]), (task_b, targets[1])]
+    pairs = [(task_a, targets[0], 1), (task_b, targets[1], 1)]
     return pairs, executor, markers
 
 

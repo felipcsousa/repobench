@@ -144,6 +144,20 @@ def render_report(data: ReportData) -> str:
         lines.append("")
         lines.extend(_pareto_plot_lines(data))
 
+    if data.reliability:
+        k = next(iter(data.reliability.values())).k
+        lines.append("")
+        lines.append(f"Reliability — {k} rollouts per task")
+        lines.append("")
+        for target_id in sorted(data.reliability):
+            stats = data.reliability[target_id]
+            lines.append(
+                f"  {target_id} pass@{stats.k} {stats.pass_at_k * 100:.0f}% · "
+                f"pass^{stats.k} {stats.pass_hat_k * 100:.0f}% · "
+                f"var {stats.per_task_variance:.2f} · "
+                f"$/reliable solve {_format_money(stats.cost_per_reliable_solve_usd)}"
+            )
+
     for comparison in data.comparisons:
         lines.append("")
         lines.append(f"{comparison.target_a} vs {comparison.target_b}")
