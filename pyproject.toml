@@ -24,9 +24,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/felipesousa/repobench"
-Repository = "https://github.com/felipesousa/repobench"
-Issues = "https://github.com/felipesousa/repobench/issues"
+Homepage = "https://github.com/felipcsousa/repobench"
+Repository = "https://github.com/felipcsousa/repobench"
+Documentation = "https://github.com/felipcsousa/repobench/blob/main/docs/PRD.md"
+Issues = "https://github.com/felipcsousa/repobench/issues"
 
 [dependency-groups]
 dev = [

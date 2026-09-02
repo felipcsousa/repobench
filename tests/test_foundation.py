@@ -87,7 +87,14 @@ def test_default_config_detection(base_repo: Path) -> None:
     (base_repo / "pyproject.toml").write_text("[project]\nname='x'\n")
     cfg = default_config_for(base_repo)
     assert cfg.project.language == "python"
-    assert cfg.project.test_command == "python -m pytest"
+    # Detected commands use the running interpreter — a bare "python" does not
+    # exist on macOS, and the suggestion would reject every task at build time.
+    import shlex
+    import sys
+
+    py = shlex.quote(sys.executable)
+    assert cfg.project.test_command == f"{py} -m pytest"
+    assert cfg.project.install_command == f"{py} -m pip install -e ."
 
 
 def test_ids() -> None:
