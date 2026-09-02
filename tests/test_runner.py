@@ -438,6 +438,136 @@ async def test_execute_regression_failure_after_task_passes_is_unsolved(tmp_path
     assert result.error is None
 
 
+# ------------------------------------------------- project.cwd knob (issue #34)
+
+
+MONO_GOLD_PATCH = """\
+diff --git a/backend/calculator.py b/backend/calculator.py
+--- a/backend/calculator.py
++++ b/backend/calculator.py
+@@ -1,2 +1,2 @@
+ def sum_even(xs):
+-    return sum(x for x in xs if x % 2 == 1)
++    return sum(x for x in xs if x % 2 == 0)
+"""
+
+# The hidden verifier itself asserts the two cwd contracts (issue #34): it only
+# passes when pytest ran from backend/ (project.cwd) and the install command
+# left its marker there — run at the repo root instead, the trial goes UNSOLVED.
+MONO_VERIFIER_PATCH = """\
+diff --git a/backend/test_hidden.py b/backend/test_hidden.py
+new file mode 100644
+--- /dev/null
++++ b/backend/test_hidden.py
+@@ -0,0 +1,13 @@
++import os
++from pathlib import Path
++
++from calculator import sum_even
++
++
++def test_sum_even():
++    assert sum_even([1, 2, 3, 4]) == 6
++
++
++def test_runs_in_the_configured_project_cwd():
++    assert os.path.basename(os.getcwd()) == "backend"
++    assert Path("install_marker.txt").is_file()
+"""
+
+MONO_FIX_AGENT = """\
+import sys
+from pathlib import Path
+
+ws = Path(sys.argv[1])
+# The harness always receives the workspace root (issue #34) — the agent must
+# see the whole repo even when project.cwd points the verifiers at backend/.
+assert (ws / "backend" / "calculator.py").is_file(), "harness cwd must be the repo root"
+p = ws / "backend" / "calculator.py"
+p.write_text(p.read_text().replace("x % 2 == 1", "x % 2 == 0"))
+print("fixed backend sum_even")
+"""
+
+
+def _make_monorepo_task(base: Path, task_id: str = "t_mono") -> TaskPackage:
+    """_make_task with the project living in backend/: only a verifier run with
+    project.cwd='backend' finds the tests, so the SOLVED verdict itself proves
+    the cwd composition."""
+    history = base / "history"
+    (history / "backend").mkdir(parents=True)
+    (history / "backend" / "calculator.py").write_text(BASE_CALCULATOR)
+    (history / "backend" / "test_calc.py").write_text(TEST_CALC)
+    _git(history, "init", "--quiet", "--initial-branch=main")
+    _git(history, "add", "-A")
+    _git(history, "commit", "--quiet", "-m", "initial")
+
+    package = base / "task"
+    package.mkdir()
+    with (package / "base.tar").open("wb") as fh:
+        subprocess.run(
+            ["git", "archive", "--format=tar", "HEAD"],
+            cwd=history,
+            stdout=fh,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+    (package / "instruction.md").write_text(INSTRUCTION)
+    (package / "verifier.patch").write_text(MONO_VERIFIER_PATCH)
+    (package / "gold.patch").write_text(MONO_GOLD_PATCH)
+    (package / "metadata.json").write_text(
+        json.dumps({"task_id": task_id, "base_sha": "0" * 40, "gold_sha": "1" * 40})
+    )
+    return TaskPackage.load(package)
+
+
+async def test_execute_project_cwd_runs_install_and_verifier_in_subdir(tmp_path: Path) -> None:
+    """Issue #34: install and verifiers run in project.cwd inside the workspace
+    while the harness still receives the repo root (asserted by the agent)."""
+    task = _make_monorepo_task(tmp_path)
+    fix_agent = _write_agent(tmp_path, "mono_fix_agent.py", MONO_FIX_AGENT)
+    project_cfg = ProjectConfig(
+        cwd="backend",
+        install_command=f'"{sys.executable}" -c "open(\'install_marker.txt\', \'w\').write(\'x\')"',
+        test_command=f'"{sys.executable}" -m pytest -q',
+    )
+    executor = _executor(tmp_path, project_cfg=project_cfg)
+    result = await executor.execute(task, _command_target("mono-agent", fix_agent))
+
+    assert result.outcome == TrialOutcome.SOLVED, result.error
+    assert result.task_verified is True
+    assert result.regression_verified is True
+
+
+async def test_execute_missing_project_cwd_verifier_is_verifier_error(tmp_path: Path) -> None:
+    """A workspace without project.cwd is a config problem: VERIFIER_ERROR with
+    a clear message — never a crash, never a silent UNSOLVED."""
+    task = _make_task(tmp_path)
+    fix_agent = _write_agent(tmp_path, "mono_missing_agent.py", FIX_AGENT)
+    project_cfg = ProjectConfig(cwd="no_such_dir", test_command=f'"{sys.executable}" -m pytest -q')
+    executor = _executor(tmp_path, project_cfg=project_cfg)
+    result = await executor.execute(task, _command_target("missing-cwd", fix_agent))
+
+    assert result.outcome == TrialOutcome.VERIFIER_ERROR
+    assert "project.cwd" in (result.error or "")
+    assert "no_such_dir" in (result.error or "")
+
+
+async def test_execute_missing_project_cwd_install_is_setup_error(tmp_path: Path) -> None:
+    task = _make_task(tmp_path)
+    fix_agent = _write_agent(tmp_path, "mono_missing_install.py", FIX_AGENT)
+    project_cfg = ProjectConfig(
+        cwd="no_such_dir",
+        install_command="echo hi",
+        test_command=f'"{sys.executable}" -m pytest -q',
+    )
+    executor = _executor(tmp_path, project_cfg=project_cfg)
+    result = await executor.execute(task, _command_target("missing-cwd", fix_agent))
+
+    assert result.outcome == TrialOutcome.SETUP_ERROR
+    assert "project.cwd" in (result.error or "")
+    assert result.task_verified is None
+
+
 # ----------------------------------------------------------- concurrency model
 
 

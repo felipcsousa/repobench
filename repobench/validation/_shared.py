@@ -13,6 +13,9 @@ is surfaced in `details` with the tail of stdout/stderr. Inverted checks (noop,
 PRD §78) swap the two: a decisive exit 1 means the check passed. Commands always
 run with the plain inherited environment (env=None): trial-env sanitization is for
 harness execution, not for verifier runs.
+run in the configured project.cwd sub-directory when set (issue #34 — commands
+are argv-only, so `cd X && Y` is impossible); a workspace missing that directory
+is an inconclusive environment problem, never a crash.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ from pathlib import Path
 
 import pydantic
 
-from repobench.config import ProjectConfig
+from repobench.config import ProjectConfig, compose_cwd
 from repobench.core.types import ProcessResult, RejectionCode, TaskPackage
 from repobench.execution.process import run_sync
 from repobench.execution.workspace import Workspace, WorkspaceManager, apply_git_patch
@@ -147,9 +150,20 @@ def _run_spec(
     manager = ws = None
     try:
         manager, ws = new_trial(task, workspaces_root)
+        # Issue #34: install and the check command run in project.cwd when set;
+        # a workspace without that directory is an environment problem, surfaced
+        # as inconclusive — never a task defect, never a crash.
+        run_dir = compose_cwd(ws.repo_dir, project)
+        if not run_dir.is_dir():
+            return check_inconclusive(
+                spec.name,
+                start,
+                f"project.cwd {project.cwd!r} does not exist in the materialized "
+                f"workspace ({ws.repo_dir}) — fix project.cwd in repobench.yml",
+            )
         install_argv = split_command(project.install_command)
         if install_argv is not None:
-            install = run_sync(install_argv, ws.repo_dir)
+            install = run_sync(install_argv, run_dir)
             if install.exit_code != 0:
                 return check_inconclusive(
                     spec.name,
@@ -174,7 +188,7 @@ def _run_spec(
                     start,
                     f"verifier patch failed to apply: {err.strip()[-OUTPUT_TAIL_CHARS:]}",
                 )
-        result = run_sync(argv, ws.repo_dir)
+        result = run_sync(argv, run_dir)
         decisive_pass = (result.exit_code == 1) if spec.invert else (result.exit_code == 0)
         if decisive_pass:
             return CheckResult(

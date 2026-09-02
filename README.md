@@ -109,6 +109,7 @@ project:
   install_command: uv sync --frozen
   test_command: python -m pytest
   regression_command: python -m pytest
+  # cwd: backend  # monorepos: run the commands inside a sub-project (relative to the repo root)
 
 benchmark:
   size: 24
@@ -132,6 +133,12 @@ targets:
     harness: opencode
     model: zai/glm-x
 ```
+
+Monorepos: `doctor` and `init` also list sub-projects that carry their own
+runner (`backend/`, `api/`, `server/`, `apps/*/`, `packages/*/`, `services/*/`).
+Benchmarking still uses one command set — set `project.cwd` (a repo-relative
+path) to choose where install/test run. Commands stay argv-only, so `cd X && …`
+is not possible; the agent always works from the repository root.
 
 ## What you get
 

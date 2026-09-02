@@ -15,6 +15,7 @@ from tests.fixtures.gitutil import (
     CALCULATOR_FIXED,
     TEST_CALC,
     TEST_MULTIPLY,
+    TEST_SUM_EVEN,
     build_repo,
     commit_all,
     git,
@@ -421,3 +422,86 @@ def test_check_determinism_skipped_without_test_command(tmp_path: Path) -> None:
         task, ProjectConfig(test_command=None), workspaces_root=tmp_path / "ws", runs=2
     )
     assert result.passed is None
+
+
+# ------------------------------------------------ project.cwd knob (issue #34)
+
+
+# Exit 0 only when run from backend/ AND the install command left its marker
+# there — proves install and the check command both ran in project.cwd.
+IN_BACKEND_CMD = (
+    f'{sys.executable} -c "import os, sys; sys.exit(0 if '
+    "os.path.basename(os.getcwd()) == 'backend' and "
+    'os.path.exists(\'install_marker.txt\') else 1)"'
+)
+
+
+def make_backend_task(tmp_path: Path) -> TaskPackage:
+    """Task whose BASE tree carries a backend/ sub-project — the monorepo shape
+    project.cwd targets. The standard fixture repo has no subdirectory, and a
+    workspace is materialized from base.tar, so the sub-project must be tracked
+    in the base commit."""
+    repo = tmp_path / "mono"
+    repo.mkdir()
+    git(repo, "init", "--quiet", "--initial-branch=main")
+    (repo / "calculator.py").write_text(CALCULATOR_BUGGY)
+    (repo / "test_calc.py").write_text(TEST_CALC)
+    (repo / "backend").mkdir()
+    (repo / "backend" / "server.py").write_text("# the real FastAPI-style backend\n")
+    base_sha = commit_all(repo, "initial commit")
+    git(repo, "checkout", "--quiet", "-b", "feat/fix-sum-even")
+    (repo / "calculator.py").write_text(CALCULATOR_FIXED)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_sum_even.py").write_text(TEST_SUM_EVEN)
+    head_sha = commit_all(repo, "fix sum_even")
+    merge_sha = merge_pr(repo, 9, "feat/fix-sum-even")
+    return build_task_package(
+        repo,
+        make_candidate(
+            {
+                "repo": repo,
+                "number": 9,
+                "base_sha": base_sha,
+                "head_sha": head_sha,
+                "merge_sha": merge_sha,
+            }
+        ),
+        tmp_path / "pkg",
+    )
+
+
+def test_check_runs_install_and_command_inside_project_cwd(tmp_path: Path) -> None:
+    task = make_backend_task(tmp_path)
+    project = make_project(
+        cwd="backend",
+        install_command=f"{sys.executable} -c \"open('install_marker.txt', 'w').write('x')\"",
+        test_command=IN_BACKEND_CMD,
+    )
+    result = check_oracle(task, project, workspaces_root=tmp_path / "ws")
+    assert result.passed is True
+    assert result.code is None
+
+    # Control: the same command without project.cwd runs at the workspace root,
+    # where neither the backend dir nor the install marker exists → decisive fail.
+    root_run = check_oracle(
+        task, make_project(test_command=IN_BACKEND_CMD), workspaces_root=tmp_path / "ws2"
+    )
+    assert root_run.passed is False
+    assert root_run.code == RejectionCode.GOLD_FAILS
+
+
+def test_check_missing_project_cwd_is_inconclusive(tmp_path: Path) -> None:
+    """A workspace that lacks project.cwd is an environment problem, never a
+    task defect — inconclusive (code None), with the fix named in the details."""
+    task = make_backend_task(tmp_path)
+    project = make_project(cwd="does_not_exist")
+    result = check_noop(task, project, workspaces_root=tmp_path / "ws")
+    assert result.passed is False
+    assert result.code is None
+    assert "project.cwd" in result.details
+    assert "does_not_exist" in result.details
+    assert "repobench.yml" in result.details
+
+    report = TaskValidator(project, workspaces_root=tmp_path / "ws2").validate(task)
+    assert report.status == TaskStatus.REJECTED
+    assert report.rejection_code == RejectionCode.ENVIRONMENT_UNSUPPORTED

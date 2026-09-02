@@ -3,6 +3,7 @@ CliRunner — hermetic, no network, no harness binaries required."""
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from repobench.cli.app import app
 from repobench.config import ProjectConfig, RepoBenchConfig
 from repobench.core.types import ExecutionTarget
 from repobench.storage.db import Storage
+from tests.fixtures.gitutil import commit_all, git
 
 runner = CliRunner()
 
@@ -101,6 +103,71 @@ def test_init_outside_git_repo_fails_politely(tmp_path: Path, monkeypatch: pytes
     assert result.exit_code == 1
     assert "not inside a git repository" in result.output
     assert not (tmp_path / "repobench.yml").exists()
+
+
+# ------------------------------------------- monorepo detection (issue #34)
+
+
+def _monorepo_repo(tmp_path: Path, *, root_test_script: bool) -> Path:
+    """The lumpfish shape: npm root project + python backend/, committed as a
+    real git repo so doctor/init can find the root."""
+    repo = tmp_path / "mono"
+    repo.mkdir()
+    scripts = {"test": "jest --ci"} if root_test_script else {"build": "next build"}
+    (repo / "package.json").write_text(json.dumps({"name": "mono", "scripts": scripts}))
+    backend = repo / "backend"
+    backend.mkdir()
+    (backend / "pyproject.toml").write_text("[project]\nname = 'backend'\n")
+    git(repo, "init", "--quiet", "--initial-branch=main")
+    commit_all(repo, "initial")
+    return repo
+
+
+def test_doctor_surfaces_subprojects_and_monorepo_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _monorepo_repo(tmp_path, root_test_script=True)
+    monkeypatch.chdir(repo)
+    result = _invoke("doctor")
+    assert result.exit_code == 0, result.output
+    assert "JavaScript/TypeScript" in result.output
+    assert "↳ backend" in result.output
+    assert "Python" in result.output
+    assert "python -m pytest" in result.output
+    assert "project.cwd" in result.output  # the monorepo hint names the knob
+
+
+def test_doctor_flags_missing_root_test_command_without_inventing_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _monorepo_repo(tmp_path, root_test_script=False)
+    monkeypatch.chdir(repo)
+    result = _invoke("doctor")
+    assert result.exit_code == 0, result.output
+    assert "no test command" in result.output
+    assert "npm test" not in result.output  # never print an invented command
+    assert "↳ backend" in result.output  # the ignored backend is still visible
+
+
+def test_init_lists_subprojects_and_never_autosets_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _monorepo_repo(tmp_path, root_test_script=False)
+    monkeypatch.chdir(repo)
+    result = _invoke("init", "--yes")
+    assert result.exit_code == 0, result.output
+    assert "sub-projects detected" in result.output
+    assert "backend" in result.output
+    assert "project.cwd" in result.output
+    assert "none detected" in result.output  # the root's honest None suggestion
+
+    content = (repo / "repobench.yml").read_text()
+    assert "language: javascript-typescript" in content
+    assert "test_command: null" in content  # the lumpfish guarantee
+    assert "npm test" not in content
+    # never auto-set: benchmarking only the backend is the user's decision
+    cwd_lines = [line for line in content.splitlines() if line.strip().startswith("cwd:")]
+    assert all("null" in line for line in cwd_lines)
 
 
 # -------------------------------------------------------------------- targets

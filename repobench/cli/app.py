@@ -121,8 +121,8 @@ def _doctor_repo(root: Path | None) -> str | None:
 
 
 def _doctor_project(root: Path | None) -> None:
-    from repobench.cli.render import OK, echo
-    from repobench.config import detect_project_environment
+    from repobench.cli.render import MISS, OK, echo
+    from repobench.config import detect_project_environment, detect_subprojects
 
     language_names = {
         "python": "Python",
@@ -144,6 +144,34 @@ def _doctor_project(root: Path | None) -> None:
         echo(f"      install: {project.install_command}")
     if project.test_command:
         echo(f"      test:    {project.test_command}")
+    else:
+        # Issue #34 honesty: never imply `npm test` exists when it does not —
+        # an invented suggestion guarantees BASELINE_BROKEN at first build.
+        echo(f"      {MISS} no test command detected — set project.test_command in repobench.yml")
+
+    # Issue #34: sub-projects with their own runners are surfaced here so a
+    # FastAPI backend is never invisible behind a Next.js root project.
+    subprojects = detect_subprojects(root)
+    if not subprojects:
+        return
+    for detected in subprojects:
+        sub = detected.config
+        sub_name = language_names.get(sub.language or "", sub.language or "unknown")
+        identity = f"  ↳ {detected.path} — {sub_name}"
+        if sub.package_manager:
+            identity += f" · {sub.package_manager}"
+        echo(identity)
+        if sub.install_command:
+            echo(f"      install: {sub.install_command}")
+        if sub.test_command:
+            echo(f"      test:    {sub.test_command}")
+        else:
+            echo("      no test command — set project.test_command or project.cwd manually")
+    echo("")
+    echo(
+        "  monorepo: benchmarking uses ONE command set — point project.cwd "
+        "(repobench.yml) at the sub-project where install/test should run"
+    )
 
 
 def _doctor_harnesses(capability_table: bool) -> None:
@@ -190,7 +218,7 @@ def doctor(
         False, "--harnesses", help="Include the per-harness capability table."
     ),
 ) -> None:
-    """Check repository, project tooling and installed harnesses (PRD §91-92)."""
+    """Check repository, project tooling, sub-projects and installed harnesses (PRD §91-92)."""
     from repobench.cli.render import echo
 
     echo("RepoBench Doctor")
@@ -218,7 +246,7 @@ def init(
     yes: bool = typer.Option(False, "--yes", help="Accept suggestions without prompting."),
     force: bool = typer.Option(False, "--force", help="Overwrite an existing repobench.yml."),
 ) -> None:
-    """Detect the project environment and write repobench.yml (PRD §95)."""
+    """Detect the project environment (root and sub-projects) and write repobench.yml (PRD §95)."""
     from repobench.cli import render
     from repobench.cli.services import init_project, resolve_repo_root
     from repobench.core.errors import RepoBenchError

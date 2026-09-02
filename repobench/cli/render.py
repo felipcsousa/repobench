@@ -13,7 +13,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table as RichTable
 
-from repobench.config import RepoBenchConfig
+from repobench.config import RepoBenchConfig, detect_subprojects
 from repobench.core.types import AnalyzeSummary, CandidateInfo, ExecutionTarget
 from repobench.execution.pricing_catalog import lookup as catalog_lookup
 
@@ -505,6 +505,32 @@ def render_clean_plan(plan, *, apply: bool) -> None:  # noqa: ANN001 - CleanPlan
     echo(f"approx. {plan.freed_bytes / 1_048_576:.1f} MB freed")
 
 
+def subproject_summary_lines(root: Path) -> list[str]:
+    """Issue #34: one honest line per detected sub-project — the backend the
+    old root-only detection silently ignored. Empty when none exist, so callers
+    never print a monorepo header for a single-project repo. A sub-project
+    without a test command says so instead of inventing one."""
+    projects = detect_subprojects(root)
+    if not projects:
+        return []
+    lines = [
+        "sub-projects detected (one command set benchmarks — project.cwd picks where it runs):"
+    ]
+    for project in projects:
+        cfg = project.config
+        identity = [project.path, cfg.language or "unknown"]
+        if cfg.package_manager:
+            identity.append(cfg.package_manager)
+        if cfg.install_command:
+            identity.append(f"install: {cfg.install_command}")
+        if cfg.test_command:
+            identity.append(f"test: {cfg.test_command}")
+        else:
+            identity.append("no test command — set project.test_command or project.cwd")
+        lines.append("  " + " · ".join(identity))
+    return lines
+
+
 def config_summary_lines(cfg: RepoBenchConfig, root: Path) -> list[str]:
     project = cfg.project
     lines = [
@@ -512,10 +538,21 @@ def config_summary_lines(cfg: RepoBenchConfig, root: Path) -> list[str]:
         f"language:  {project.language or 'not detected'}",
         f"packages:  {project.package_manager or 'not detected'}",
     ]
+    if project.cwd:
+        # Issue #34: the monorepo knob is part of the summary so a configured
+        # sub-directory is always visible next to the commands it redirects.
+        lines.append(f"cwd:       {project.cwd}")
     if project.install_command:
         lines.append(f"install:   {project.install_command}")
     if project.test_command:
         lines.append(f"test:      {project.test_command}")
+    elif project.language:
+        # Issue #34 honesty: say so instead of implying `npm test` exists —
+        # an invented suggestion guarantees BASELINE_BROKEN at first build.
+        lines.append("test:      none detected — set project.test_command in repobench.yml")
+    # Issue #34: surface every sub-project so the ignored backend is seen
+    # before the first build, not after a guaranteed-broken run.
+    lines.extend(subproject_summary_lines(root))
     lines.append("edit repobench.yml to adjust commands, targets and benchmark size.")
     return lines
 
