@@ -288,6 +288,7 @@ def analyze(ctx: typer.Context) -> None:
         + f" · lookback {cfg.repository.lookback_days} days"
     )
     render.render_analyze_summary(outcome, outcome.summary.suggested_benchmark_size, lookback_note)
+    render.render_merge_style_warnings(outcome)
     if outcome.public_repository:
         render.render_public_repository_warning()
     render.echo("Next: repobench benchmark build")

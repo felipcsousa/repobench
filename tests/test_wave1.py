@@ -278,6 +278,9 @@ class TestPublicRepository:
             def enrich(self, pr):  # noqa: ANN001 - PRInfo
                 return pr
 
+            def merged_pr_count(self, since, limit=500):  # noqa: ANN001 - issue #31
+                return None  # no ground truth in this stub — recall stays hidden
+
             def visibility(self) -> str:
                 return "PUBLIC"
 

@@ -161,6 +161,18 @@ def make_pr(
     return merge_sha
 
 
+def squash_pr(repo: Path, number: int, files: dict[str, str], subject: str) -> str:
+    """GitHub squash-style "merge": commit `files` straight onto main with the
+    squash subject convention `<subject> (#N)` — a single-parent commit, no
+    merge commit exists. Returns the squashed commit sha."""
+    git(repo, "checkout", "--quiet", "main")
+    for name, content in files.items():
+        target = repo / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+    return commit_all(repo, f"{subject} (#{number})")
+
+
 # ------------------------------------------------------ calculator-fixture repo
 
 

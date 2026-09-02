@@ -46,6 +46,22 @@ def _target_provider(target: ExecutionTarget) -> str:
     return "inherited"
 
 
+def _merge_style_label(styles) -> str:  # noqa: ANN001 - MergeStyleCounts
+    """e.g. "12 merge commits · 13 squash"; zero-count styles are omitted so the
+    line never claims work the repository does not have."""
+    parts = []
+    if styles.merge_commits:
+        parts.append(f"{styles.merge_commits} merge commits")
+    if styles.squash:
+        parts.append(f"{styles.squash} squash")
+    return " · ".join(parts)
+
+
+def _recall_label(mined: int, total: int) -> str:
+    counts = f"{mined}/{total} merged PRs"
+    return f"{counts} ({round(100 * mined / total)}%)" if total > 0 else counts
+
+
 def render_analyze_summary(
     outcome, suggested_size: int, lookback_note: str
 ) -> None:  # noqa: ANN001 - AnalyzeOutcome (avoids import cycle)
@@ -53,6 +69,13 @@ def render_analyze_summary(
     echo("RepoBench analyzed your repository")
     echo("")
     kv("Merged PRs", f"{outcome.merged_prs}")
+    # Issue #31 fields — getattr keeps the renderer usable with older outcomes.
+    styles = getattr(outcome, "merge_styles", None)
+    if styles is not None and styles.merge_commits + styles.squash > 0:
+        kv("Merge style", _merge_style_label(styles))
+    recall_total = getattr(outcome, "recall_total", None)
+    if recall_total is not None:
+        kv("Recall vs GitHub", _recall_label(outcome.merged_prs, recall_total))
     kv("Potential task candidates", f"{summary.task_candidates}")
     kv("Validated eval candidates", str(summary.validated_candidates))
     echo("")
@@ -74,6 +97,32 @@ def render_analyze_summary(
     echo("")
     echo(f"{lookback_note}")
     echo("No inference tokens were consumed.")
+
+
+def render_merge_style_warnings(outcome) -> None:  # noqa: ANN001 - AnalyzeOutcome
+    """Issue #31 field-credibility notes: squash-merged PRs are mined from
+    commit subjects, and — only when gh ground truth exists — recall low enough
+    to prove some history is invisible (rebase merges carry no PR number in git
+    at all). Without gh, nothing is claimed about recall."""
+    styles = getattr(outcome, "merge_styles", None)
+    if styles is not None and styles.squash:
+        plural = "s" if styles.squash != 1 else ""
+        echo(
+            f"{WARN} merge style: {styles.squash} squash-merged PR{plural} mined "
+            "from commit subjects (#N) — no merge commits for them exist"
+        )
+    recall_total = getattr(outcome, "recall_total", None)
+    if not recall_total:  # None (no gh) or 0 merged PRs — no honest recall claim
+        return
+    mined = outcome.merged_prs
+    if recall_total > 0 and round(100 * mined / recall_total) < 70:
+        missing = recall_total - mined
+        plural = "s" if missing != 1 else ""
+        echo(
+            f"{WARN} low recall: {missing} of {recall_total} merged PR"
+            f"{plural} in the window are invisible to mining — PRs merged by "
+            "rebase carry no PR number in git at all"
+        )
 
 
 def render_candidates_table(candidates: list[CandidateInfo]) -> None:
