@@ -14,6 +14,7 @@ from rich.table import Table as RichTable
 
 from repobench.config import RepoBenchConfig
 from repobench.core.types import AnalyzeSummary, CandidateInfo, ExecutionTarget
+from repobench.execution.pricing_catalog import lookup as catalog_lookup
 
 # Never truncate data on a pipe: terminals get their real width, captured output
 # (tests, CI) gets plenty of room so table cells are never ellipsized.
@@ -105,9 +106,19 @@ def render_candidates_table(candidates: list[CandidateInfo]) -> None:
     console.print(table)
 
 
+def _target_pricing_label(target: ExecutionTarget, cfg: RepoBenchConfig) -> str:
+    """Issue #17: where the target's cost will come from — the user's
+    `pricing:` rule, the bundled catalog (`~` marks an estimate), or nothing."""
+    if target.model and target.model in cfg.pricing:
+        return "user"
+    if catalog_lookup(target.model) is not None:
+        return "catalog~"
+    return "—"
+
+
 def render_targets_table(cfg: RepoBenchConfig) -> None:
     table = RichTable(header_style="bold")
-    for column in ("TARGET", "HARNESS", "MODEL", "PROVIDER"):
+    for column in ("TARGET", "HARNESS", "MODEL", "PROVIDER", "PRICING"):
         table.add_column(column)
     for target in cfg.targets.values():
         table.add_row(
@@ -115,6 +126,7 @@ def render_targets_table(cfg: RepoBenchConfig) -> None:
             target.harness,
             target.model or "(harness default)",
             _target_provider(target),
+            _target_pricing_label(target, cfg),
         )
     console.print(table)
 
@@ -167,6 +179,10 @@ def render_benchmark_build(outcome) -> None:  # noqa: ANN001 - BenchmarkBuildOut
     echo("")
     kv("Representativeness", str(outcome.health.representativeness))
     kv("Validation", str(outcome.health.validation_confidence))
+    # Issue #19: None means the persisted health predates the component — no
+    # invented score (renderers must handle it).
+    verifier = outcome.health.verifier_strength
+    kv("Verifier strength", "—" if verifier is None else str(verifier))
     kv("Leakage", str(outcome.health.leakage_resistance))
     kv("Recency", str(outcome.health.recency))
     kv("Diversity", str(outcome.health.diversity))

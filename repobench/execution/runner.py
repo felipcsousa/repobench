@@ -35,6 +35,7 @@ from repobench.core.types import (
     TrialResult,
     utcnow,
 )
+from repobench.execution import pricing_catalog
 from repobench.execution.adapters.base import HarnessAdapter
 from repobench.execution.adapters.registry import get_adapter
 from repobench.execution.environment import TrialEnvironment
@@ -307,18 +308,21 @@ class TrialExecutor:
         _write_output_artifact(stderr_path, proc.stderr)
 
         # 8. CAPTURE PATCH (working tree vs synthetic BASE, commits included)
+        # plus the test-tamper classification of that same diff (issue #18).
         files_changed = loc_added = loc_removed = None
         agent_patch = None
+        tampered_tests: list[str] = []
         patch_error: str | None = None
         patch_path = artifacts_dir / "trials" / trial_id / "agent.patch"
         try:
             stats = capture_agent_patch(ws.repo_dir, patch_path)
-            files_changed, loc_added, loc_removed = stats
+            files_changed, loc_added, loc_removed, tampered_tests = stats
             agent_patch = str(patch_path)
         except Exception as exc:
             _LOG.warning("trial %s: patch capture failed: %s", trial_id, exc)
             files_changed = loc_added = loc_removed = None
             agent_patch = None
+            tampered_tests = []
             patch_error = f"patch capture failed: {exc}"
 
         task_verified: bool | None = None
@@ -337,9 +341,13 @@ class TrialExecutor:
         if patch_error is not None:
             error = f"{error}; {patch_error}" if error else patch_error
 
-        # 12. COLLECT METRICS (cost attribution, PRD §55)
+        # 12. COLLECT METRICS (cost attribution, PRD §55, issue #17):
+        # harness-reported > user `pricing:` rule > bundled catalog estimate
+        # (only when the model is known to the catalog) > unknown.
         pricing = self.pricing.get(target.model) if self.pricing else None
-        cost_usd, cost_source = resolve_cost(usage, pricing)
+        cost_usd, cost_source = resolve_cost(
+            usage, pricing, catalog_price=pricing_catalog.lookup(target.model)
+        )
 
         result = TrialResult(
             **base,
@@ -356,6 +364,7 @@ class TrialExecutor:
             loc_added=loc_added,
             loc_removed=loc_removed,
             agent_patch=agent_patch,
+            tampered_tests=tampered_tests,
             prompt_path=prompt_path_str,
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),

@@ -78,6 +78,39 @@ def test_claude_parse_output_garbage(stdout: str) -> None:
     assert result == HarnessResult()
 
 
+def test_claude_parse_output_cost_and_counts() -> None:
+    # issue #17: the result JSON's top level carries total_cost_usd, num_turns
+    # and tool_use_count — all lifted when present.
+    stdout = (
+        '{"type":"result","total_cost_usd":0.42,"num_turns":7,"tool_use_count":3,'
+        '"usage":{"input_tokens":120,"cache_read_input_tokens":80,"output_tokens":45}}\n'
+    )
+    result = ClaudeAdapter().parse_output(stdout, "")
+    assert result.usage == UsageRecord(
+        input_tokens=120,
+        cached_input_tokens=80,
+        output_tokens=45,
+        requests=7,
+        tool_calls=3,
+        reported_cost_usd=0.42,
+    )
+
+
+def test_claude_parse_output_cost_without_usage_dict() -> None:
+    result = ClaudeAdapter().parse_output('{"type":"result","total_cost_usd":1.5}\n', "")
+    assert result.usage == UsageRecord(reported_cost_usd=1.5)
+
+
+def test_claude_parse_output_never_coerces_malformed_extras() -> None:
+    # Wrong-typed cost/turns/tool fields are ignored, never coerced (PRD §54).
+    stdout = (
+        '{"type":"result","total_cost_usd":"0.42","num_turns":true,'
+        '"tool_use_count":null,"usage":{"input_tokens":10,"output_tokens":5}}\n'
+    )
+    result = ClaudeAdapter().parse_output(stdout, "")
+    assert result.usage == UsageRecord(input_tokens=10, output_tokens=5)
+
+
 def test_claude_validate_target() -> None:
     # A model-less official target yields a warning, never an error (PRD §94).
     checked = ClaudeAdapter().validate_target(ExecutionTarget(harness="claude"))
@@ -184,6 +217,39 @@ def test_opencode_parse_output_provider_style_keys() -> None:
 @pytest.mark.parametrize("stdout", ["", "plain text only", '{"usage":{"bogus":1}}', "}}garbage{{"])
 def test_opencode_parse_output_garbage(stdout: str) -> None:
     assert OpenCodeAdapter().parse_output(stdout, "err").usage is None
+
+
+def test_opencode_parse_output_cost_and_counts() -> None:
+    # issue #17: cost/request/tool-call keys inside the usage object are lifted.
+    stdout = (
+        'done {"usage":{"input_tokens":9,"output_tokens":4,"cost":0.0123,'
+        '"requests":2,"tool_calls":1}}\n'
+    )
+    result = OpenCodeAdapter().parse_output(stdout, "")
+    assert result.usage == UsageRecord(
+        input_tokens=9,
+        output_tokens=4,
+        reported_cost_usd=0.0123,
+        requests=2,
+        tool_calls=1,
+    )
+
+
+def test_opencode_parse_output_cost_beside_tokens_container() -> None:
+    # OpenCode message info shape: a `tokens` block next to a top-level `cost`.
+    stdout = 'ok {"tokens":{"promptTokens":11,"completionTokens":2},"cost":0.5}\n'
+    result = OpenCodeAdapter().parse_output(stdout, "")
+    assert result.usage == UsageRecord(
+        input_tokens=11, output_tokens=2, reported_cost_usd=0.5
+    )
+
+
+def test_opencode_parse_output_never_coerces_malformed_cost() -> None:
+    # Wrong-typed cost/counts are ignored, never coerced (PRD §54)…
+    assert OpenCodeAdapter().parse_output('{"cost":"free","requests":null}', "err").usage is None
+    # …but a valid cost survives alongside malformed counts.
+    result = OpenCodeAdapter().parse_output('{"cost":0.5,"num_turns":"seven"}', "err")
+    assert result.usage == UsageRecord(reported_cost_usd=0.5)
 
 
 def test_opencode_validate_target() -> None:
@@ -342,6 +408,45 @@ def test_command_parse_output_never_invents_usage() -> None:
 
 
 # ------------------------------------------------------------------- registry
+
+
+# Fixture stdout per harness used to prove the capability table tells the truth
+# (issue #17): each fixture carries the cost/token shapes that harness actually
+# emits — plus a cost-looking key the harness does NOT report, to prove nothing
+# is invented for the adapters that cannot produce a cost.
+_CAPABILITY_FIXTURES: dict[str, str] = {
+    "claude": (
+        '{"type":"result","total_cost_usd":0.5,'
+        '"usage":{"input_tokens":1,"output_tokens":1}}'
+    ),
+    "codex": '{"token_count":{"input":1,"output":1},"cost_usd":9.99}',
+    "opencode": '{"tokens":{"input_tokens":1,"output_tokens":1},"cost":0.25}',
+    "gemini": '{"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1},"cost_usd":9.99}',
+    "command": '{"usage":{"input_tokens":1,"output_tokens":1},"cost_usd":9.99}',
+}
+
+
+@pytest.mark.parametrize("harness", KNOWN_HARNESSES)
+def test_capability_cost_flag_matches_parsed_output(harness: str) -> None:
+    """cost_usage must equal whether parse_output can actually produce a
+    reported_cost_usd (issue #17) — `doctor --harnesses` renders this claim."""
+    adapter = get_adapter(harness)
+    result = adapter.parse_output(_CAPABILITY_FIXTURES[harness], "")
+    produces_cost = result.usage is not None and result.usage.reported_cost_usd is not None
+    assert produces_cost == adapter.capabilities.cost_usage
+
+
+@pytest.mark.parametrize("harness", KNOWN_HARNESSES)
+def test_capability_token_flag_matches_parsed_output(harness: str) -> None:
+    """token_usage must equal whether parse_output can actually produce token
+    counts (issue #17)."""
+    adapter = get_adapter(harness)
+    result = adapter.parse_output(_CAPABILITY_FIXTURES[harness], "")
+    usage = result.usage
+    produces_tokens = usage is not None and (
+        usage.input_tokens is not None or usage.output_tokens is not None
+    )
+    assert produces_tokens == adapter.capabilities.token_usage
 
 
 def test_registry_known_harnesses() -> None:

@@ -11,6 +11,7 @@ import shutil
 import tarfile
 from pathlib import Path
 
+from repobench.core.testpaths import is_test_path
 from repobench.execution.process import run_sync
 
 SYNTHETIC_BASE_COMMIT_MESSAGE = "RepoBench benchmark base"
@@ -100,16 +101,47 @@ def diff_stats(diff_text: str) -> tuple[int, int, int]:
     return files, added, removed
 
 
-def capture_agent_patch(repo_dir: Path, out_file: Path) -> tuple[int, int, int]:
+def tampered_test_paths(diff_text: str) -> list[str]:
+    """Repo-relative test paths a unified diff touches (issue #18).
+
+    Parses the exact text capture_agent_patch writes to agent.patch. Every path
+    mentioned in a `diff --git`, `---`/`+++`, rename or copy header counts — a
+    test file the agent deletes or renames is tampering just as much as one it
+    edits, so the +++ line alone is not enough. Returns sorted, de-duplicated
+    paths; an empty or unparseable diff yields [] — detection degrades to off,
+    it never false-accuses.
+    """
+    paths: set[str] = set()
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            # "diff --git a/<old> b/<new>" — split on the " b/" join so both
+            # sides count: a pure rename carries no ---/+++ lines at all.
+            rest = line[len("diff --git "):]
+            if rest.startswith("a/") and " b/" in rest:
+                old, new = rest[2:].split(" b/", 1)
+                paths.update((old, new))
+        elif line.startswith("--- ") or line.startswith("+++ "):
+            target = line[4:]
+            if target.startswith(("a/", "b/")):
+                paths.add(target[2:])
+        elif line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
+            paths.add(line.split(" ", 2)[2])
+    return sorted({p for p in paths if p and p != "/dev/null" and is_test_path(p)})
+
+
+def capture_agent_patch(repo_dir: Path, out_file: Path) -> tuple[int, int, int, list[str]]:
     """Capture the final working tree vs the synthetic BASE, agnostic to commits the
-    agent may have created (PRD §60-61). Returns diff stats."""
+    agent may have created (PRD §60-61). Returns diff stats plus the tampered test
+    paths in the agent's final diff (issue #18) — a reward-hacking signal, never
+    part of the verdict (PRD §42: verifiers define correctness)."""
     _git(repo_dir, "add", "-A")
     r = _git(repo_dir, "rev-list", "--max-parents=0", "HEAD")
     root = r.stdout.strip().splitlines()[0]
     diff = _git(repo_dir, "diff", "--cached", root)
     out_file.parent.mkdir(parents=True, exist_ok=True)
     out_file.write_text(diff.stdout)
-    return diff_stats(diff.stdout)
+    files, added, removed = diff_stats(diff.stdout)
+    return files, added, removed, tampered_test_paths(diff.stdout)
 
 
 def snapshot_tree(source_repo_dir: Path, dest_dir: Path) -> Path:

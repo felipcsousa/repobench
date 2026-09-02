@@ -23,11 +23,14 @@ from repobench.config import RepoBenchConfig
 from repobench.core.errors import RepoBenchError, UsageError
 from repobench.core.paths import ProjectPaths
 from repobench.core.types import TaskMetadata, TrialResult
+from repobench.execution import pricing_catalog
 from repobench.repository.git import GitRepo
 from repobench.reporting.models import (
+    TAMPERED_PATHS_CAP,
     InstructionGenerationStats,
     PairComparison,
     ReportData,
+    TestTamperingStats,
 )
 from repobench.storage.db import Storage
 
@@ -94,6 +97,77 @@ def _harness_version_warnings(trials: list[TrialResult]) -> list[str]:
         f"({', '.join(sorted(versions))}) — its aggregated results mix configurations"
         for target_id, versions in sorted(versions_by_target.items())
         if len(versions) > 1
+    ]
+
+
+def _unpriced_model_warnings(trials: list[TrialResult], cfg: RepoBenchConfig) -> list[str]:
+    """Issue #17: a target whose trials carry no cost silently disables the
+    economic comparison. Say so once per target instead of staying quiet —
+    a cost source only silences the warning when it could actually produce a
+    cost: a user pricing rule, or a catalog entry WITH reported usage (a
+    catalog-known model whose harness never reported tokens is still costless)."""
+    trials_by_target: dict[str, list[TrialResult]] = {}
+    for trial in trials:
+        trials_by_target.setdefault(trial.target_id, []).append(trial)
+    warnings: list[str] = []
+    for target_id in sorted(trials_by_target):
+        target_trials = trials_by_target[target_id]
+        if any(t.usage is not None and t.cost_usd is not None for t in target_trials):
+            continue
+        model = next((t.model for t in target_trials if t.model), None)
+        if model is not None and model in cfg.pricing:
+            continue
+        if pricing_catalog.lookup(model) is not None and any(
+            t.usage is not None for t in target_trials
+        ):
+            continue
+        shown_model = model or "(harness default model)"
+        warnings.append(
+            f"target {target_id} (model {shown_model}) reported no cost and has no "
+            "usable pricing — economic comparison disabled for it"
+        )
+    return warnings
+
+
+def _test_tampering_stats(trials: list[TrialResult]) -> TestTamperingStats | None:
+    """issue #18: aggregate the reward-hacking signal across the run. Populated
+    only when at least one trial's final diff touched test files (None otherwise
+    — same gating as `reliability`); tampered-but-passing trials stay SOLVED, so
+    this section is the only place the finding surfaces (PRD §42)."""
+    flagged = [t for t in trials if t.tampered_tests]
+    if not flagged:
+        return None
+    trials_by_target: dict[str, int] = {}
+    for trial in trials:
+        trials_by_target[trial.target_id] = trials_by_target.get(trial.target_id, 0) + 1
+    by_target: dict[str, int] = {}
+    paths_by_target: dict[str, list[str]] = {}
+    for trial in flagged:
+        by_target[trial.target_id] = by_target.get(trial.target_id, 0) + 1
+        target_paths = paths_by_target.setdefault(trial.target_id, [])
+        for path in trial.tampered_tests:
+            if path not in target_paths:
+                target_paths.append(path)
+        paths_by_target[trial.target_id] = sorted(target_paths)[:TAMPERED_PATHS_CAP]
+    return TestTamperingStats(
+        flagged_trials=len(flagged),
+        total_trials=len(trials),
+        by_target=by_target,
+        trials_by_target=trials_by_target,
+        paths_by_target=paths_by_target,
+        paths=sorted({p for t in flagged for p in t.tampered_tests})[:TAMPERED_PATHS_CAP],
+    )
+
+
+def _tamper_warnings(trials: list[TrialResult]) -> list[str]:
+    """issue #18: one warning when any trial touched test files, mirroring the
+    _harness_version_warnings style — findings are never silent."""
+    flagged = sum(1 for trial in trials if trial.tampered_tests)
+    if not flagged:
+        return []
+    return [
+        f"{flagged} trial(s) touched test files after the agent ran — "
+        "reward-hacking signal (see Reward hacking section)"
     ]
 
 
@@ -180,6 +254,10 @@ def build_report_data(
     if not any("network" in warning.lower() for warning in warnings):
         warnings.append("No network isolation")
     warnings.extend(_harness_version_warnings(trials))
+    warnings.extend(_unpriced_model_warnings(trials, cfg))
+    warnings.extend(_tamper_warnings(trials))
+    # Reward-hacking signal (issue #18); None unless some trial touched tests.
+    test_tampering = _test_tampering_stats(trials)
 
     # Single source of truth (PRD §89): the immutable manifest records the
     # repository the benchmark was built from. GitRepo is only a fallback for
@@ -207,6 +285,7 @@ def build_report_data(
         segments=segments,
         instruction_generation=_generation_stats(tasks),
         reliability=reliability,
+        test_tampering=test_tampering,
         warnings=warnings,
         concurrency=run_config.get("jobs"),
         bootstrap_seed=bootstrap_seed,

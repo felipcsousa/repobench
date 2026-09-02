@@ -3,7 +3,9 @@
 Uses `opencode run` for non-interactive execution. Output is text, so usage is
 harvested defensively from any JSON blob near the end of stdout (OpenCode may
 embed a JSON trailer with `usage`/`tokens` depending on provider). Fields are
-mapped permissively (input_tokens/promptTokens/...) and never invented.
+mapped permissively (input_tokens/promptTokens/...) and never invented; a
+message's `cost` / request / tool-call counts are lifted the same way
+(issue #17).
 """
 
 from __future__ import annotations
@@ -24,6 +26,20 @@ _TAIL_CHARS = 2000
 _INPUT_KEYS = ("input_tokens", "promptTokens", "prompt_tokens", "input")
 _CACHED_KEYS = ("cached_input_tokens", "cache_read_input_tokens", "cachedTokens", "cached")
 _OUTPUT_KEYS = ("output_tokens", "completionTokens", "completion_tokens", "output")
+_COST_KEYS = ("cost", "total_cost_usd", "cost_usd")
+_REQUEST_KEYS = ("requests", "num_turns")
+_TOOL_KEYS = ("tool_calls", "tool_use_count")
+# Token keys keep their historical container precedence (usage, then tokens,
+# then the object itself); cost/request keys merge across all three so a
+# message info shaped `{"tokens": {...}, "cost": 0.5}` is not dropped.
+_MERGED_KEYS = (
+    *_INPUT_KEYS,
+    *_CACHED_KEYS,
+    *_OUTPUT_KEYS,
+    *_COST_KEYS,
+    *_REQUEST_KEYS,
+    *_TOOL_KEYS,
+)
 
 
 def _grab(data: dict, keys: tuple[str, ...]) -> int | None:
@@ -35,25 +51,39 @@ def _grab(data: dict, keys: tuple[str, ...]) -> int | None:
     return None
 
 
+def _grab_float(data: dict, keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        return float(value)
+    return None
+
+
 def _usage_from_dict(data: dict) -> UsageRecord | None:
-    input_tokens = _grab(data, _INPUT_KEYS)
-    cached = _grab(data, _CACHED_KEYS)
-    output = _grab(data, _OUTPUT_KEYS)
-    if input_tokens is None and cached is None and output is None:
-        return None
-    return UsageRecord(
-        input_tokens=input_tokens, cached_input_tokens=cached, output_tokens=output
+    record = UsageRecord(
+        input_tokens=_grab(data, _INPUT_KEYS),
+        cached_input_tokens=_grab(data, _CACHED_KEYS),
+        output_tokens=_grab(data, _OUTPUT_KEYS),
+        reported_cost_usd=_grab_float(data, _COST_KEYS),
+        requests=_grab(data, _REQUEST_KEYS),
+        tool_calls=_grab(data, _TOOL_KEYS),
     )
+    token_fields = (record.input_tokens, record.cached_input_tokens, record.output_tokens)
+    if all(field is None for field in (*token_fields, record.reported_cost_usd, record.requests, record.tool_calls)):
+        return None
+    return record
 
 
 def _usage_from_object(obj: dict) -> UsageRecord | None:
-    for container_key in ("usage", "tokens"):
-        container = obj.get(container_key)
-        if isinstance(container, dict):
-            usage = _usage_from_dict(container)
-            if usage is not None:
-                return usage
-    return _usage_from_dict(obj)
+    containers = [c for c in (obj.get("usage"), obj.get("tokens")) if isinstance(c, dict)]
+    containers.append(obj)
+    merged: dict = {}
+    for container in containers:
+        for key in _MERGED_KEYS:
+            if key not in merged and key in container:
+                merged[key] = container[key]
+    return _usage_from_dict(merged)
 
 
 class OpenCodeAdapter(HarnessAdapter):
@@ -63,6 +93,7 @@ class OpenCodeAdapter(HarnessAdapter):
         model_override=True,
         structured_output=True,
         token_usage=True,
+        # `cost` / `total_cost_usd` keys are lifted from output JSON (issue #17).
         cost_usage=True,
         auto_approval=False,
         custom_provider=True,
@@ -104,18 +135,23 @@ class OpenCodeAdapter(HarnessAdapter):
         usage: UsageRecord | None = None
         decoder = json.JSONDecoder()
         try:
-            for idx, ch in enumerate(tail):
-                if ch != "{":
+            idx = 0
+            while idx < len(tail):
+                if tail[idx] != "{":
+                    idx += 1
                     continue
                 try:
-                    obj, _end = decoder.raw_decode(tail, idx)
+                    obj, end = decoder.raw_decode(tail, idx)
                 except Exception:
+                    idx += 1
                     continue
-                if not isinstance(obj, dict):
-                    continue
-                parsed = _usage_from_object(obj)
-                if parsed is not None:
-                    usage = parsed
+                if isinstance(obj, dict):
+                    parsed = _usage_from_object(obj)
+                    if parsed is not None:
+                        usage = parsed
+                # Skip past the decoded object: nested blobs belong to it and
+                # must not overwrite its (richer) merged record.
+                idx = end
         except Exception:
             return HarnessResult()
         if usage is None:

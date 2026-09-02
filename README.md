@@ -141,11 +141,21 @@ targets:
 - **Benchmark sampling** — validated tasks are sampled greedily so the benchmark's
   task-type/subsystem/complexity distribution matches your Workload Universe.
   Coverage and a composite Benchmark Health score (with honest warnings) are
-  computed and stored; benchmarks are immutable and versioned.
+  computed and stored; benchmarks are immutable and versioned. Health includes a
+  **verifier-strength** component: flakiness across the append-only validation
+  history (tasks whose outcome flipped between builds) plus linter warnings for
+  brittle exact-string assertions in verifier tests.
 - **Local execution** — each trial materializes the base tree into a fresh
   workspace with a **synthetic git repository** (a single "RepoBench benchmark
   base" commit, no remotes, no history, no gold), runs the target's harness CLI
   with a timeout and process-group cleanup, then captures the final tree diff.
+- **Reward-hacking signal** — the agent's final diff is checked against the test
+  tree: trials that touch test files are flagged in the report ("Reward hacking —
+  test tampering") without changing the verifier's verdict.
+- **Real cost** — cost attribution follows a strict chain: harness-reported cost →
+  your `pricing:` rule → a bundled, dated pricing-catalog estimate (always marked
+  `~`/`CATALOG_ESTIMATE`, never presented as fact). Unpriced models get an explicit
+  warning instead of a silent gap.
 - **Hidden verifier + stats** — after the agent finishes, the verifier patch is
   applied on a copy and the hidden tests decide SOLVED/UNSOLVED (exit codes never
   do). Results are aggregated with Wilson confidence intervals and paired

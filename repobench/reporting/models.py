@@ -37,6 +37,31 @@ class InstructionGenerationStats(pydantic.BaseModel):
         return self.generated + self.failed
 
 
+# Display cap for the distinct tampered-path list (issue #18): the section must
+# stay readable when a rogue target rewrites the whole test suite.
+TAMPERED_PATHS_CAP = 10
+
+
+class TestTamperingStats(pydantic.BaseModel):
+    """Reward-hacking signal across a run's trials (issue #18): trials whose
+    final diff touches test files. A finding, never a verdict — tampered-but-
+    passing trials stay SOLVED (PRD §42: verifiers define correctness)."""
+
+    # not a pytest test class, despite the name
+    __test__ = False
+
+    flagged_trials: int
+    total_trials: int
+    # flagged trial count per target
+    by_target: dict[str, int]
+    # executed trial count per target, so the renderer can show "0/3" lines
+    trials_by_target: dict[str, int]
+    # tampered paths per flagged target, each list capped at TAMPERED_PATHS_CAP
+    paths_by_target: dict[str, list[str]]
+    # distinct tampered paths across the run, capped at TAMPERED_PATHS_CAP
+    paths: list[str]
+
+
 class ReportData(pydantic.BaseModel):
     """Everything a report needs; machine-readable via model_dump_json (PRD §112)."""
 
@@ -57,6 +82,9 @@ class ReportData(pydantic.BaseModel):
     # Per-target multi-rollout reliability (issue #13); None for runs that only
     # ever used a single rollout per task.
     reliability: dict[str, TargetReliability] | None = None
+    # Reward-hacking signal (issue #18); None unless at least one trial's final
+    # diff touched test files — same gating pattern as reliability.
+    test_tampering: TestTamperingStats | None = None
     warnings: list[str]
     concurrency: int | None
     # Stored bootstrap seed (PRD §104: "com seed armazenada") so the run's

@@ -26,6 +26,13 @@ def _int_field(data: dict, key: str) -> int | None:
     return int(value)
 
 
+def _float_field(data: dict, key: str) -> float | None:
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 class ClaudeAdapter(HarnessAdapter):
     name = "claude"
     binary = "claude"
@@ -33,7 +40,8 @@ class ClaudeAdapter(HarnessAdapter):
         model_override=True,
         structured_output=True,
         token_usage=True,
-        cost_usage=False,
+        # total_cost_usd is parsed from the result JSON (issue #17).
+        cost_usage=True,
         auto_approval=True,
         custom_provider=False,
     )
@@ -68,7 +76,12 @@ class ClaudeAdapter(HarnessAdapter):
         )
 
     def parse_output(self, stdout: str, stderr: str) -> HarnessResult:
-        """The result object is the last stdout line that starts with '{'."""
+        """The result object is the last stdout line that starts with '{'.
+
+        Token counts live under `usage`; the top level also carries
+        `total_cost_usd`, `num_turns` and `tool_use_count` — each lifted only
+        when actually present, never invented (issue #17, PRD §54).
+        """
         try:
             last_json_line: str | None = None
             for line in (stdout or "").splitlines():
@@ -80,19 +93,31 @@ class ClaudeAdapter(HarnessAdapter):
             data = json.loads(last_json_line)
             if not isinstance(data, dict):
                 return HarnessResult()
-            usage = data.get("usage")
-            if not isinstance(usage, dict):
-                return HarnessResult()
-            input_tokens = _int_field(usage, "input_tokens")
-            cached_input_tokens = _int_field(usage, "cache_read_input_tokens")
-            output_tokens = _int_field(usage, "output_tokens")
-            if input_tokens is None and output_tokens is None and cached_input_tokens is None:
+            usage_data = data.get("usage")
+            usage_dict = usage_data if isinstance(usage_data, dict) else {}
+            input_tokens = _int_field(usage_dict, "input_tokens")
+            cached_input_tokens = _int_field(usage_dict, "cache_read_input_tokens")
+            output_tokens = _int_field(usage_dict, "output_tokens")
+            reported_cost_usd = _float_field(data, "total_cost_usd")
+            requests = _int_field(data, "num_turns")
+            tool_calls = _int_field(data, "tool_use_count")
+            if (
+                input_tokens is None
+                and output_tokens is None
+                and cached_input_tokens is None
+                and reported_cost_usd is None
+                and requests is None
+                and tool_calls is None
+            ):
                 return HarnessResult()
             return HarnessResult(
                 usage=UsageRecord(
                     input_tokens=input_tokens,
                     cached_input_tokens=cached_input_tokens,
                     output_tokens=output_tokens,
+                    requests=requests,
+                    tool_calls=tool_calls,
+                    reported_cost_usd=reported_cost_usd,
                 )
             )
         except Exception:

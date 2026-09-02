@@ -311,11 +311,19 @@ class TrialResult(BaseModel):
     task_verified: bool | None = None
     regression_verified: bool | None = None
     cost_usd: float | None = None
-    cost_source: Literal["HARNESS_REPORTED", "USER_PROVIDED_PRICING"] | None = None
+    # CATALOG_ESTIMATE marks costs computed from the bundled pricing snapshot —
+    # an estimate, never a harness/user figure (issue #17).
+    cost_source: Literal["HARNESS_REPORTED", "USER_PROVIDED_PRICING", "CATALOG_ESTIMATE"] | None = (
+        None
+    )
     files_changed: int | None = None
     loc_added: int | None = None
     loc_removed: int | None = None
     agent_patch: str | None = None
+    # Repo-relative test files the agent's final diff touches (issue #18) — a
+    # reward-hacking signal recorded as a finding, never folded into `error`
+    # and never changing `outcome` (PRD §42: verifiers define correctness).
+    tampered_tests: list[str] = Field(default_factory=list)
     prompt_path: str | None = None
     workspace: str | None = None
     error: str | None = None
