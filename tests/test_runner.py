@@ -15,7 +15,7 @@ from repobench.core.types import CommandSpec, ExecutionTarget, ProcessResult, Ta
 from repobench.execution import runner as runner_module
 from repobench.execution.runner import TrialExecutor, build_task_prompt, run_matrix
 from repobench.execution.testreport import JUNIT_FILENAME, TestCounts, invokes_pytest
-from repobench.execution.workspace import WorkspaceManager
+from repobench.execution.workspace import WorkspaceManager, apply_git_patch, snapshot_tree
 
 BASE_CALCULATOR = "def sum_even(xs):\n    return sum(x for x in xs if x % 2 == 1)\n"
 FIXED_CALCULATOR = "def sum_even(xs):\n    return sum(x for x in xs if x % 2 == 0)\n"
@@ -540,15 +540,52 @@ async def test_execute_project_cwd_runs_install_and_verifier_in_subdir(tmp_path:
         install_command=f'"{sys.executable}" -c "open(\'install_marker.txt\', \'w\').write(\'x\')"',
         test_command=f'"{sys.executable}" -m pytest -q',
     )
-    executor = _executor(tmp_path, project_cfg=project_cfg)
+    # keep_workspaces lets the failure diagnostic below replay the verifier
+    # in the real final tree — the only way to see WHY a hidden test failed
+    # on a platform we cannot run locally (windows CI, tracked in #43-adjacent
+    # debugging of run 33757581284).
+    executor = _executor(
+        tmp_path,
+        project_cfg=project_cfg,
+        execution_cfg=ExecutionConfig(keep_workspaces=True),
+        keep=True,
+    )
     result = await executor.execute(task, _command_target("mono-agent", fix_agent))
 
-    assert result.outcome == TrialOutcome.SOLVED, (
-        f"error={result.error} tests={result.tests_passed}/{result.tests_total} "
-        f"failed={result.tests_failed} patch_tail={(result.agent_patch or '')[-400:]}"
-    )
+    assert result.outcome == TrialOutcome.SOLVED, _mono_diagnosis(result, task)
     assert result.task_verified is True
     assert result.regression_verified is True
+
+
+def _mono_diagnosis(result, task: TaskPackage) -> str:  # noqa: ANN001
+    """Failure forensics for the monorepo e2e: replay the verifier exactly as
+    the runner did (snapshot + patch + pytest -v) and dump why it failed."""
+    lines = [
+        f"error={result.error} tests={result.tests_passed}/{result.tests_total} "
+        f"failed={result.tests_failed}",
+    ]
+    ws = Path(result.workspace) if result.workspace else None
+    if ws is None or not ws.is_dir():
+        return "\n".join(lines + [f"workspace gone: {result.workspace}"])
+    calc = ws / "backend" / "calculator.py"
+    lines.append(f"calculator.py bytes: {calc.read_bytes() if calc.is_file() else '(missing)'}")
+    lines.append(f"install marker: {(ws / 'backend' / 'install_marker.txt').is_file()}")
+    patch = Path(result.agent_patch) if result.agent_patch else None
+    if patch is not None and patch.is_file():
+        lines.append(f"agent.patch:\n{patch.read_text()[-1500:]}")
+    replay = ws.parent / "diag_replay"
+    snapshot_tree(ws, replay)
+    ok, err = apply_git_patch(replay, task.verifier_patch)
+    lines.append(f"verifier patch applied: {ok} {err.strip() if err else ''}")
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-v", "--no-header", "-rA"],
+        cwd=replay / "backend",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    lines.append(f"replay exit={proc.returncode}\n{proc.stdout[-3000:]}")
+    return "\n".join(lines)
 
 
 async def test_execute_missing_project_cwd_verifier_is_verifier_error(tmp_path: Path) -> None:
