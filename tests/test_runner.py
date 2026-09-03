@@ -114,7 +114,11 @@ def _write_agent(tmp_path: Path, name: str, source: str) -> Path:
     agents = tmp_path / "agents"
     agents.mkdir(exist_ok=True)
     script = agents / name
-    script.write_text(source)
+    # Explicit UTF-8: agent sources carry em-dashes in comments, and the
+    # Windows default (cp1252) writes them as \x97 — which Python's UTF-8
+    # source reader rejects with a SyntaxError before the agent runs at all
+    # (the windows-latest forensics of run 33762798968).
+    script.write_text(source, encoding="utf-8")
     return script
 
 
