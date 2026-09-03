@@ -36,6 +36,10 @@ def make_trial(
     cost_usd: float | None = None,
     cost_source: str | None = None,
     files_changed: int | None = None,
+    tests_passed: int | None = None,
+    tests_failed: int | None = None,
+    tests_skipped: int | None = None,
+    tests_total: int | None = None,
 ) -> TrialResult:
     return TrialResult(
         trial_id=f"{target_id}:{task_id}",
@@ -47,6 +51,10 @@ def make_trial(
         cost_usd=cost_usd,
         cost_source=cost_source,
         files_changed=files_changed,
+        tests_passed=tests_passed,
+        tests_failed=tests_failed,
+        tests_skipped=tests_skipped,
+        tests_total=tests_total,
     )
 
 
@@ -153,6 +161,41 @@ class TestAggregateTrials:
         assert d.total_cost_usd == pytest.approx(0.5)
         assert d.cost_per_solve_usd is None
         assert d.effective_cost_usd == pytest.approx(0.5)  # falls back to the total
+
+    def test_partial_credit_mean_over_trials_with_counts(self):
+        # Onda 4: mean of passed/(total-skipped) over the trials that carry
+        # counts — 9/(12-1) = 0.818 and 6/(12-2) = 0.6 — while the count-less
+        # trial contributes nothing (numbers are never invented).
+        trials = [
+            make_trial("t1", "A", tests_passed=9, tests_failed=2, tests_skipped=1, tests_total=12),
+            make_trial("t2", "A", tests_passed=6, tests_failed=4, tests_skipped=2, tests_total=12),
+            make_trial("t3", "A"),
+        ]
+        a = aggregate_trials(trials)["A"]
+        assert a.tests_partial_n == 2
+        assert a.tests_partial == pytest.approx((9 / 11 + 6 / 10) / 2)
+        assert a.tests_mean_passed == pytest.approx(7.5)
+        assert a.tests_mean_denominator == pytest.approx(10.5)
+
+    def test_partial_credit_none_when_no_trial_has_counts(self):
+        a = aggregate_trials([make_trial("t1", "A")])["A"]
+        assert a.tests_partial is None
+        assert a.tests_partial_n == 0
+        assert a.tests_mean_passed is None
+        assert a.tests_mean_denominator is None
+
+    def test_all_skipped_suite_is_not_data(self):
+        # total == skipped means no real test ran (denominator <= 0): the trial
+        # stays out of the mean and out of n, so nothing fake is averaged in.
+        trials = [
+            make_trial("t1", "A", tests_passed=0, tests_failed=0, tests_skipped=5, tests_total=5),
+            make_trial("t2", "A", tests_passed=3, tests_failed=0, tests_skipped=0, tests_total=3),
+        ]
+        a = aggregate_trials(trials)["A"]
+        assert a.tests_partial_n == 1
+        assert a.tests_partial == pytest.approx(1.0)
+        assert a.tests_mean_passed == pytest.approx(3.0)
+        assert a.tests_mean_denominator == pytest.approx(3.0)
 
 
 class TestSegmentBreakdown:

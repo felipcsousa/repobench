@@ -26,6 +26,7 @@ import asyncio
 import logging
 import shlex
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -45,12 +46,20 @@ from repobench.execution.adapters.base import HarnessAdapter
 from repobench.execution.adapters.registry import get_adapter
 from repobench.execution.environment import TrialEnvironment
 from repobench.execution.process import MAX_OUTPUT_BYTES, run_process
+from repobench.execution.testreport import (
+    JUNIT_FILENAME,
+    TestCounts,
+    augmented_argv,
+    invokes_pytest,
+    parse_junit,
+)
 from repobench.execution.usage import resolve_cost
 from repobench.execution.workspace import (
     Workspace,
     WorkspaceManager,
     apply_git_patch,
     capture_agent_patch,
+    diff_touched_paths,
     snapshot_tree,
     verify_synthetic_invariants,
 )
@@ -147,7 +156,16 @@ class TrialExecutor:
     ) -> TrialResult:
         started_at = utcnow()
         trial_id = new_trial_id()
-        ctx: dict = {"phase": "setup", "ws": None, "artifacts_dir": self.artifacts_dir}
+        ctx: dict = {
+            "phase": "setup",
+            "ws": None,
+            "artifacts_dir": self.artifacts_dir,
+            # Wall clock of the WHOLE trial (install + agent + verify + publish),
+            # recorded in _publish as duration_ms — the harness-only figure
+            # lives in harness_ms (a 3-trial noop run on real repos measured
+            # minutes while the report said 0s).
+            "t0": time.monotonic(),
+        }
         try:
             return await self._execute(
                 task,
@@ -177,8 +195,7 @@ class TrialExecutor:
                 started_at=started_at,
                 error=f"unexpected error: {exc}",
             )
-            self._publish(result, ctx)
-            return result
+            return self._publish(result, ctx)
 
     # ------------------------------------------------------------- pipeline
 
@@ -292,7 +309,7 @@ class TrialExecutor:
                     **base,
                     outcome=TrialOutcome.SETUP_ERROR,
                     exit_code=proc.exit_code,
-                    duration_ms=proc.duration_ms,
+                    harness_ms=proc.duration_ms,
                     error=f"harness could not be started: {proc.spawn_error}",
                 ),
                 ctx,
@@ -333,13 +350,16 @@ class TrialExecutor:
         task_verified: bool | None = None
         regression_verified: bool | None = None
         error: str | None = None
+        test_counts: TestCounts | None = None
 
         if proc.timed_out:
             # 7. TIMEOUT: no verification; stats already recorded best-effort.
             outcome = TrialOutcome.TIMEOUT
         else:
             ctx["phase"] = "verify"
-            outcome, task_verified, regression_verified, error = await self._verify(task, ws)
+            outcome, task_verified, regression_verified, error, test_counts = await self._verify(
+                task, ws
+            )
 
         # A patch-capture failure is never silent: it lands in the result's
         # error field alongside (but never masking) any verifier error.
@@ -359,10 +379,17 @@ class TrialExecutor:
             outcome=outcome,
             exit_code=proc.exit_code,
             timed_out=proc.timed_out,
-            duration_ms=proc.duration_ms,
+            harness_ms=proc.duration_ms,
             usage=usage,
             task_verified=task_verified,
             regression_verified=regression_verified,
+            # Partial credit (PRD §4): a finding beside the verdict — None across
+            # the board when no report was extracted (numbers are never invented).
+            tests_passed=test_counts.passed if test_counts else None,
+            tests_failed=test_counts.failed if test_counts else None,
+            tests_skipped=test_counts.skipped if test_counts else None,
+            tests_total=test_counts.total if test_counts else None,
+            test_report_source="pytest-junit" if test_counts else None,
             cost_usd=cost_usd,
             cost_source=cost_source,
             files_changed=files_changed,
@@ -377,8 +404,7 @@ class TrialExecutor:
             error=error,
         )
         # 13. DESTROY WORKSPACE + persist trial manifest + notify
-        self._publish(result, ctx)
-        return result
+        return self._finish(result, ctx)
 
     # -------------------------------------------------------------- helpers
 
@@ -407,17 +433,33 @@ class TrialExecutor:
 
     async def _verify(
         self, task: TaskPackage, ws: Workspace
-    ) -> tuple[TrialOutcome, bool | None, bool | None, str | None]:
-        """Steps 9-11: hidden verifier on a snapshot copy of the final tree (PRD §62)."""
+    ) -> tuple[TrialOutcome, bool | None, bool | None, str | None, TestCounts | None]:
+        """Steps 9-11: hidden verifier on a snapshot copy of the final tree (PRD §62).
+
+        Also returns the per-test counts extracted from the task verifier's JUnit
+        report (partial credit, PRD §4) — None on every early-error path and
+        whenever no report was produced."""
         try:
             verify_ws = snapshot_tree(ws.repo_dir, ws.base_dir / "verify")
         except Exception as exc:
-            return TrialOutcome.VERIFIER_ERROR, None, None, f"verification snapshot failed: {exc}"
+            return (
+                TrialOutcome.VERIFIER_ERROR,
+                None,
+                None,
+                f"verification snapshot failed: {exc}",
+                None,
+            )
 
         ok, err = apply_git_patch(verify_ws, task.verifier_patch)
         if not ok:
             tail = (err or "").strip()[-_ERROR_TAIL_CHARS:]
-            return TrialOutcome.VERIFIER_ERROR, None, None, f"verifier patch failed to apply: {tail}"
+            return (
+                TrialOutcome.VERIFIER_ERROR,
+                None,
+                None,
+                f"verifier patch failed to apply: {tail}",
+                None,
+            )
 
         if not self.project_cfg.test_command:
             return (
@@ -425,6 +467,7 @@ class TrialExecutor:
                 None,
                 None,
                 "no test_command configured (set project.test_command in repobench.yml)",
+                None,
             )
 
         # Issue #34: verifiers run in project.cwd inside the snapshot copy; the
@@ -438,47 +481,109 @@ class TrialExecutor:
                 None,
                 f"project.cwd {self.project_cfg.cwd!r} does not exist in the verification "
                 f"workspace ({verify_ws}) — fix project.cwd in repobench.yml",
+                None,
             )
 
-        task_verified = await self._run_verifier(self.project_cfg.test_command, verify_dir)
+        # Partial credit (PRD §4.2): the report lives at the ROOT of the verify
+        # snapshot (not the composed cwd) and only the TASK verifier invocation
+        # carries the flag — "off" keeps the argv byte-identical to the command.
+        junit_path = verify_ws / JUNIT_FILENAME
+        want_report = self.project_cfg.test_report == "auto"
+        # Hidden-only denominator: testcases count only when they live in a file
+        # the verifier patch touches, so a noop agent scores 0/N instead of
+        # (suite−N)/suite on a mostly-green suite. An unreadable or path-less
+        # patch yields an empty set — which parses to None (never a silent
+        # whole-suite fallback).
+        junit_filter: frozenset[str] = frozenset()
+        if want_report:
+            try:
+                junit_filter = frozenset(diff_touched_paths(task.verifier_patch.read_text()))
+            except OSError as exc:
+                _LOG.debug("trial verifier patch unreadable: %s", exc)
+
+        task_verified, task_counts = await self._run_verifier(
+            self.project_cfg.test_command,
+            verify_dir,
+            junit_path=junit_path if want_report else None,
+            junit_filter=junit_filter,
+        )
         if isinstance(task_verified, str):
-            return TrialOutcome.VERIFIER_ERROR, None, None, task_verified
+            return TrialOutcome.VERIFIER_ERROR, None, None, task_verified, task_counts
         if task_verified is False:
             # Hidden task verifier failed: the trial is UNSOLVED (PRD §63).
-            return TrialOutcome.UNSOLVED, False, None, None
+            return TrialOutcome.UNSOLVED, False, None, None, task_counts
 
+        # The regression run never receives junit_path — even when it falls back
+        # to test_command — so the task report stays the recorded one.
         regression_command = self.project_cfg.regression_command or self.project_cfg.test_command
-        regression_verified = await self._run_verifier(regression_command, verify_dir)
+        regression_verified, _ = await self._run_verifier(regression_command, verify_dir)
         if isinstance(regression_verified, str):
-            return TrialOutcome.VERIFIER_ERROR, True, None, regression_verified
+            return TrialOutcome.VERIFIER_ERROR, True, None, regression_verified, task_counts
 
         if task_verified and regression_verified:
-            return TrialOutcome.SOLVED, True, True, None
-        return TrialOutcome.UNSOLVED, task_verified, regression_verified, None
+            return TrialOutcome.SOLVED, True, True, None, task_counts
+        return TrialOutcome.UNSOLVED, task_verified, regression_verified, None, task_counts
 
-    async def _run_verifier(self, command: str, run_dir: Path) -> bool | str:
+    async def _run_verifier(
+        self,
+        command: str,
+        run_dir: Path,
+        junit_path: Path | None = None,
+        junit_filter: frozenset[str] | None = None,
+    ) -> tuple[bool | str, TestCounts | None]:
         """True=pass, False=fail (exit 1), str=verifier crashed (any other exit).
         run_dir is the composed project.cwd directory (issue #34), pre-checked
-        for existence by the caller."""
+        for existence by the caller.
+
+        Partial credit (PRD §4): when a report is wanted ("auto"), junit_path is
+        given AND the command invokes pytest, `--junitxml=<junit_path>` is
+        appended last (last-wins) and the report is parsed right after the run —
+        before the workspace dies with the snapshot — with no extra process.
+        junit_filter scopes the counts to the hidden verifier's tests (see
+        _verify). The verdict is computed exactly as before; counts come back
+        None for non-pytest commands, "off" mode, and unparseable/empty/
+        unmatchable reports."""
         try:
             argv = shlex.split(command)
         except ValueError as exc:
-            return f"invalid verifier command {command!r}: {exc}"
+            return f"invalid verifier command {command!r}: {exc}", None
+
+        attached = False
+        if (
+            junit_path is not None
+            and self.project_cfg.test_report == "auto"
+            and invokes_pytest(argv)
+        ):
+            argv = augmented_argv(argv, junit_path)
+            attached = True
+
         result = await run_process(
             CommandSpec(argv=argv, cwd=run_dir, timeout_seconds=_VERIFIER_TIMEOUT_SECONDS)
         )
-        if result.exit_code == 0:
-            return True
-        if result.exit_code == 1:
-            return False
-        tail = (result.stderr or result.stdout or "").strip()[-_ERROR_TAIL_CHARS:]
-        return f"verifier crashed (exit {result.exit_code}): {tail}"
 
-    def _publish(self, result: TrialResult, ctx: dict) -> None:
+        # Parse before returning: the XML lives in the verify snapshot, which is
+        # destroyed at publish time (PRD §4.2).
+        counts = parse_junit(junit_path, verifier_paths=junit_filter) if attached else None
+        if result.exit_code == 0:
+            return True, counts
+        if result.exit_code == 1:
+            return False, counts
+        tail = (result.stderr or result.stdout or "").strip()[-_ERROR_TAIL_CHARS:]
+        return f"verifier crashed (exit {result.exit_code}): {tail}", counts
+
+    def _publish(self, result: TrialResult, ctx: dict) -> TrialResult:
         """Destroy workspace, persist the trial manifest, notify (PRD §59, §99-100).
 
-        Never raises — but a failure here is never silent either.
+        Never raises — but a failure here is never silent either. Returns the
+        result with duration_ms stamped from the trial wall clock (t0 in ctx):
+        every outcome path funnels through here, so the persisted manifest, the
+        on_result callback and execute()'s caller all see the same total.
         """
+        t0 = ctx.get("t0")
+        if t0 is not None:
+            result = result.model_copy(
+                update={"duration_ms": int((time.monotonic() - t0) * 1000)}
+            )
         ws = ctx.get("ws")
         if ws is not None:
             try:
@@ -499,10 +604,10 @@ class TrialExecutor:
                 self.on_result(result)
             except Exception as exc:
                 _LOG.warning("trial %s: on_result callback failed: %s", result.trial_id, exc)
+        return result
 
     def _finish(self, result: TrialResult, ctx: dict) -> TrialResult:
-        self._publish(result, ctx)
-        return result
+        return self._publish(result, ctx)
 
 
 async def run_matrix(

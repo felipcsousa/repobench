@@ -5,13 +5,16 @@ with sys.executable — no real harness binary and no network)."""
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 
 from repobench.config import ExecutionConfig, ProjectConfig
-from repobench.core.types import ExecutionTarget, TaskPackage, TrialOutcome
+from repobench.core.types import CommandSpec, ExecutionTarget, ProcessResult, TaskPackage, TrialOutcome
+from repobench.execution import runner as runner_module
 from repobench.execution.runner import TrialExecutor, build_task_prompt, run_matrix
+from repobench.execution.testreport import JUNIT_FILENAME, TestCounts, invokes_pytest
 from repobench.execution.workspace import WorkspaceManager
 
 BASE_CALCULATOR = "def sum_even(xs):\n    return sum(x for x in xs if x % 2 == 1)\n"
@@ -626,3 +629,284 @@ async def test_run_matrix_jobs_one_serializes(tmp_path: Path) -> None:
     b_start, b_end = _read_interval(markers, "agent-b")
     # jobs=1: the second harness only starts after the first one finished
     assert min(a_end, b_end) <= max(a_start, b_start)
+
+
+# ------------------------------------------------- partial credit (PRD §4)
+
+
+# Hidden verifier with a 3-test suite over sum_even. Chosen so a "half-fixed"
+# implementation passes exactly 2 of 3 (see PARTIAL_FIX_AGENT below).
+TRIO_VERIFIER_PATCH = """\
+diff --git a/test_trio.py b/test_trio.py
+new file mode 100644
+--- /dev/null
++++ b/test_trio.py
+@@ -0,0 +1,13 @@
++from calculator import sum_even
++
++
++def test_one():
++    assert sum_even([1, 2]) == 2
++
++
++def test_two():
++    assert sum_even([3, 4]) == 4
++
++
++def test_three():
++    assert sum_even([2, 4]) == 6
+"""
+
+# Corrects the parity bug but drops the first element (off-by-one), so exactly
+# one hidden test still fails: the red → partially-green anchor case.
+PARTIAL_FIX_AGENT = """\
+import sys
+from pathlib import Path
+
+ws = Path(sys.argv[1])
+p = ws / "calculator.py"
+p.write_text(
+    "def sum_even(xs):\\n"
+    "    return sum(xs[i] for i in range(1, len(xs)) if xs[i] % 2 == 0)\\n"
+)
+print("partially fixed sum_even")
+"""
+
+MINI_JUNIT = """\
+<?xml version="1.0" encoding="utf-8"?>
+<testsuite name="pytest" tests="3" failures="1" skipped="1">
+    <testcase classname="test_trio" name="test_ok"/>
+    <testcase classname="test_trio" name="test_bad">
+        <failure message="assert">AssertionError</failure>
+    </testcase>
+    <testcase classname="test_trio" name="test_skip">
+        <skipped message="not yet"/>
+    </testcase>
+</testsuite>
+"""
+
+
+def _make_trio_task(base: Path, task_id: str = "t_trio") -> TaskPackage:
+    """Task whose hidden verifier is a 3-test suite (test_trio.py) on a base
+    that also carries a pre-existing GREEN suite (test_green.py, 2 tests) —
+    so hidden-scoped counts (3) are distinguishable from whole-suite counts
+    (5) and the e2e actually proves the filter."""
+    history = base / "history"
+    history.mkdir(parents=True)
+    (history / "calculator.py").write_text(BASE_CALCULATOR)
+    (history / "test_green.py").write_text(
+        "def test_green_one():\n    assert 1 + 1 == 2\n\n\ndef test_green_two():\n    assert [x for x in range(3)] == [0, 1, 2]\n"
+    )
+    _git(history, "init", "--quiet", "--initial-branch=main")
+    _git(history, "add", "-A")
+    _git(history, "commit", "--quiet", "-m", "initial")
+
+    package = base / "task"
+    package.mkdir()
+    with (package / "base.tar").open("wb") as fh:
+        subprocess.run(
+            ["git", "archive", "--format=tar", "HEAD"],
+            cwd=history,
+            stdout=fh,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+    (package / "instruction.md").write_text(INSTRUCTION)
+    (package / "verifier.patch").write_text(TRIO_VERIFIER_PATCH)
+    (package / "gold.patch").write_text(GOLD_PATCH)
+    (package / "metadata.json").write_text(
+        json.dumps({"task_id": task_id, "base_sha": "0" * 40, "gold_sha": "1" * 40})
+    )
+    return TaskPackage.load(package)
+
+
+def _capture_run_process(monkeypatch, *, exit_code: int = 1, junit: str | None = None):
+    """Replace runner.run_process with a fake that records every CommandSpec and,
+    when junit is set, writes that XML at the path of the LAST --junitxml= token
+    (mirroring pytest's last-wins report writing)."""
+    captured: list[CommandSpec] = []
+
+    async def fake_run_process(spec: CommandSpec) -> ProcessResult:
+        captured.append(spec)
+        if junit is not None:
+            junit_tokens = [t for t in spec.argv if t.startswith("--junitxml=")]
+            if junit_tokens:
+                Path(junit_tokens[-1].split("=", 1)[1]).write_text(junit)
+        return ProcessResult(exit_code=exit_code)
+
+    monkeypatch.setattr(runner_module, "run_process", fake_run_process)
+    return captured
+
+
+async def test_execute_partial_fix_records_partial_credit_counts(tmp_path: Path) -> None:
+    """PRD anchor case (red → partially green): the verdict stays exit-code-only
+    UNSOLVED while the JUnit report records the per-test split beside it."""
+    task = _make_trio_task(tmp_path)
+    partial_agent = _write_agent(tmp_path, "partial_agent.py", PARTIAL_FIX_AGENT)
+    executor = _executor(tmp_path)
+
+    result = await executor.execute(task, _command_target("partial", partial_agent))
+
+    assert result.outcome == TrialOutcome.UNSOLVED
+    assert result.task_verified is False
+    assert result.tests_passed == 2
+    assert result.tests_failed == 1
+    assert result.tests_skipped == 0
+    assert result.tests_total == 3
+    assert result.test_report_source == "pytest-junit"
+    # Hidden-only denominator: the base's pre-existing green suite (2 tests in
+    # test_green.py) ran in the same verifier process but must stay outside
+    # the counts — whole-suite would read 2/5, not 2/3.
+    # Honest trial duration (R2): total wall time > 0 (install+agent+verify)
+    # and dominates the harness-only figure.
+    assert result.duration_ms > 0
+    assert result.harness_ms is not None
+    assert result.harness_ms <= result.duration_ms
+
+
+async def test_execute_verdict_identical_with_and_without_report(tmp_path: Path) -> None:
+    """The same task, fully fixed: SOLVED under "auto" (counts 3/3) and SOLVED
+    under "off" (fields None) — the report never moves the verdict."""
+    agent = _write_agent(tmp_path, "full_fix_agent.py", FIX_AGENT)
+
+    executor_auto = _executor(tmp_path)
+    result_auto = await executor_auto.execute(
+        _make_trio_task(tmp_path / "auto"), _command_target("full-auto", agent)
+    )
+    executor_off = _executor(
+        tmp_path,
+        project_cfg=ProjectConfig(
+            test_command=f'"{sys.executable}" -m pytest -q', test_report="off"
+        ),
+    )
+    result_off = await executor_off.execute(
+        _make_trio_task(tmp_path / "off"), _command_target("full-off", agent)
+    )
+
+    assert result_auto.outcome == TrialOutcome.SOLVED
+    assert result_auto.task_verified is True
+    assert result_auto.tests_passed == 3
+    assert result_auto.tests_failed == 0
+    assert result_auto.tests_skipped == 0
+    assert result_auto.tests_total == 3
+    assert result_auto.test_report_source == "pytest-junit"
+
+    assert result_off.outcome == TrialOutcome.SOLVED
+    assert result_off.task_verified is True
+    assert result_off.tests_passed is None
+    assert result_off.tests_failed is None
+    assert result_off.tests_skipped is None
+    assert result_off.tests_total is None
+    assert result_off.test_report_source is None
+
+    # identical verdicts with and without the report — and identical to each other
+    assert result_auto.outcome == result_off.outcome
+    assert result_auto.task_verified == result_off.task_verified
+
+
+async def test_run_verifier_off_keeps_argv_byte_identical(tmp_path: Path, monkeypatch) -> None:
+    """PRD acceptance: test_report="off" keeps the verifier argv byte-identical
+    to the configured command — no flag appended, no counts invented."""
+    captured = _capture_run_process(monkeypatch)
+    executor = _executor(
+        tmp_path,
+        project_cfg=ProjectConfig(
+            test_command=f'"{sys.executable}" -m pytest -q', test_report="off"
+        ),
+    )
+    command = f'"{sys.executable}" -m pytest -q'
+
+    verdict, counts = await executor._run_verifier(
+        command, tmp_path, junit_path=tmp_path / JUNIT_FILENAME
+    )
+
+    assert verdict is False  # exit-1 semantics untouched
+    assert counts is None
+    assert captured[0].argv == shlex.split(command)
+
+
+async def test_run_verifier_auto_appends_flag_and_parses_counts(tmp_path: Path, monkeypatch) -> None:
+    captured = _capture_run_process(monkeypatch, junit=MINI_JUNIT)
+    executor = _executor(tmp_path)  # default test_report="auto"
+    command = f'"{sys.executable}" -m pytest -q'
+    junit = tmp_path / JUNIT_FILENAME
+
+    verdict, counts = await executor._run_verifier(command, tmp_path, junit_path=junit)
+
+    assert verdict is False
+    assert counts == TestCounts(passed=1, failed=1, skipped=1, total=3)
+    assert captured[0].argv == [*shlex.split(command), f"--junitxml={junit}"]
+
+
+async def test_run_verifier_auto_leaves_non_pytest_command_alone(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A non-pytest verifier never gets the flag: counts stay None (honest)."""
+    captured = _capture_run_process(monkeypatch)
+    executor = _executor(tmp_path, project_cfg=ProjectConfig(test_command="npm test"))
+
+    verdict, counts = await executor._run_verifier(
+        "npm test", tmp_path, junit_path=tmp_path / JUNIT_FILENAME
+    )
+
+    assert verdict is False
+    assert counts is None
+    assert captured[0].argv == ["npm", "test"]
+
+
+async def test_run_verifier_auto_user_junitxml_is_overridden_by_ours(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A user --junitxml stays in the argv but ours is appended after it — and
+    ours (last-wins) is the report that gets parsed."""
+    junit = tmp_path / JUNIT_FILENAME
+    captured = _capture_run_process(monkeypatch, junit=MINI_JUNIT)
+    executor = _executor(tmp_path)
+    command = f'"{sys.executable}" -m pytest --junitxml=proprio.xml'
+
+    verdict, counts = await executor._run_verifier(command, tmp_path, junit_path=junit)
+
+    assert verdict is False
+    assert counts is not None and counts.total == 3  # our report was the one parsed
+    argv = captured[0].argv
+    assert argv.index("--junitxml=proprio.xml") < argv.index(f"--junitxml={junit}")
+
+
+async def test_regression_fallback_run_gets_no_junit_flag(tmp_path: Path, monkeypatch) -> None:
+    """PRD §4.2: the flag rides ONLY the task verifier invocation — the
+    regression run stays flagless even when it falls back to the very same
+    pytest-shaped test_command."""
+    captured = _capture_run_process(monkeypatch, exit_code=0, junit=MINI_JUNIT)
+    task = _make_trio_task(tmp_path)
+    agent = _write_agent(tmp_path, "full_fix_agent.py", FIX_AGENT)
+    executor = _executor(tmp_path)  # test_report "auto"; regression_command unset → fallback
+
+    result = await executor.execute(task, _command_target("noflag-reg", agent))
+
+    assert result.outcome == TrialOutcome.SOLVED  # both fake verifiers exited 0
+    pytest_specs = [spec for spec in captured if invokes_pytest(spec.argv)]
+    assert len(pytest_specs) == 2  # task verifier + regression fallback, nothing else
+    flagged = [
+        spec for spec in pytest_specs if any(t.startswith("--junitxml=") for t in spec.argv)
+    ]
+    assert len(flagged) == 1  # exactly the task verifier carries the flag
+    assert result.tests_total == 3  # counts came from that single flagged run
+
+
+async def test_run_verifier_auto_without_xml_keeps_counts_none(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """PRD edge case: exit 0 with no report file produced — verdict stands, the
+    five fields stay None (nothing invented, no crash)."""
+    captured = _capture_run_process(monkeypatch, exit_code=0)  # writes no XML
+    executor = _executor(tmp_path)  # test_report "auto"
+    command = f'"{sys.executable}" -m pytest -q'
+
+    verdict, counts = await executor._run_verifier(
+        command, tmp_path, junit_path=tmp_path / JUNIT_FILENAME
+    )
+
+    assert verdict is True
+    assert counts is None
+    assert not (tmp_path / JUNIT_FILENAME).exists()
+    assert captured[0].argv[-1].startswith("--junitxml=")  # flag was attached, file wasn't

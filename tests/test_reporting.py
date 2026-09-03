@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import csv
+import io
 from datetime import datetime, timezone
+
+import pytest
 
 from repobench.analysis.metrics import SegmentStat, TargetMetrics
 from repobench.analysis.pareto import ParetoResult
 from repobench.analysis.recommendation import Recommendation
 from repobench.analysis.stats import wilson_ci
 from repobench.benchmark.health import HealthReport
+from repobench.cli.maintenance import RunRowView, RunShowView
+from repobench.cli.render import render_run_show
+from repobench.core.types import TrialOutcome, TrialResult
 from repobench.reporting import (
     InstructionGenerationStats,
     PairComparison,
@@ -16,6 +23,7 @@ from repobench.reporting import (
     render_json,
     render_report,
 )
+from repobench.reporting.export import CSV_COLUMNS, render_csv
 
 GENERATED_AT = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
 
@@ -277,6 +285,44 @@ class TestTerminalReport:
         assert "LOW SAMPLE" not in text
 
 
+class TestPartialCreditSection:
+    """Onda 4: per-test partial credit surfaced per target — the section only
+    exists when at least one target has data, and n is always visible."""
+
+    def test_partial_credit_renders_with_data(self):
+        data = sample_report_data()
+        data.targets[0] = data.targets[0].model_copy(
+            update={
+                "tests_partial": 0.78,
+                "tests_partial_n": 14,
+                "tests_mean_passed": 9.0,
+                "tests_mean_denominator": 12.0,
+            }
+        )
+        text = render_report(data)
+        assert "Partial credit (hidden tests — mean passed/(total-skipped) over trials with data)" in text
+        assert "claude: partial 0.78 (n=14 trials)" in text
+
+    def test_partial_credit_section_absent_without_data(self):
+        # sample targets carry no counts: nothing is invented, no section at all.
+        text = render_report(sample_report_data())
+        assert "Partial credit" not in text
+
+    def test_partial_credit_target_without_data_renders_placeholder(self):
+        data = sample_report_data()
+        data.targets[0] = data.targets[0].model_copy(
+            update={
+                "tests_partial": 0.78,
+                "tests_partial_n": 14,
+                "tests_mean_passed": 9.0,
+                "tests_mean_denominator": 12.0,
+            }
+        )
+        text = render_report(data)
+        assert "codex: — (n=0 trials)" in text
+        assert "glm: — (n=0 trials)" in text
+
+
 class TestJsonReport:
     def test_json_round_trip(self):
         data = sample_report_data()
@@ -288,6 +334,22 @@ class TestJsonReport:
         parsed = ReportData.model_validate_json(render_json(data))
         assert parsed.targets[0].wilson_lo is not None
         assert parsed.targets[0].wilson_hi is not None
+
+    def test_json_carries_partial_credit_fields(self):
+        data = sample_report_data()
+        data.targets[0] = data.targets[0].model_copy(
+            update={
+                "tests_partial": 0.78,
+                "tests_partial_n": 14,
+                "tests_mean_passed": 9.0,
+                "tests_mean_denominator": 12.0,
+            }
+        )
+        parsed = ReportData.model_validate_json(render_json(data))
+        assert parsed.targets[0].tests_partial == pytest.approx(0.78)
+        assert parsed.targets[0].tests_partial_n == 14
+        assert parsed.targets[0].tests_mean_passed == pytest.approx(9.0)
+        assert parsed.targets[0].tests_mean_denominator == pytest.approx(12.0)
 
     def test_json_carries_pareto_and_generation_and_seed(self):
         parsed = ReportData.model_validate_json(render_json(sample_report_data()))
@@ -302,3 +364,105 @@ class TestJsonReport:
 
     def test_json_is_indented(self):
         assert "\n" in render_json(sample_report_data())
+
+
+def _counted_trial(**counts: int | None) -> TrialResult:
+    return TrialResult(
+        trial_id="trial_1",
+        run_id="run_1",
+        benchmark_id="rb_b_x",
+        task_id="task_1",
+        target_id="claude",
+        outcome=TrialOutcome.SOLVED,
+        **counts,
+    )
+
+
+class TestCsvPerTestCounts:
+    """Onda 4: the hidden-verifier per-test counts ride along in the CSV."""
+
+    def test_csv_columns_after_tampered_tests(self):
+        expected = [
+            "tests_passed",
+            "tests_failed",
+            "tests_skipped",
+            "tests_total",
+            "test_report_source",
+        ]
+        start = CSV_COLUMNS.index("tampered_tests") + 1
+        assert list(CSV_COLUMNS[start : start + 5]) == expected
+
+    def test_csv_row_carries_counts(self):
+        trial = _counted_trial(
+            tests_passed=9,
+            tests_failed=2,
+            tests_skipped=1,
+            tests_total=12,
+            test_report_source="pytest-junit",
+        )
+        rows = list(csv.reader(io.StringIO(render_csv([trial]))))
+        header, row = rows[0], rows[1]
+        assert row[header.index("tests_passed")] == "9"
+        assert row[header.index("tests_failed")] == "2"
+        assert row[header.index("tests_skipped")] == "1"
+        assert row[header.index("tests_total")] == "12"
+        assert row[header.index("test_report_source")] == "pytest-junit"
+
+    def test_csv_counts_empty_without_data(self):
+        # No extracted report ⇒ empty cells, never zeros.
+        rows = list(csv.reader(io.StringIO(render_csv([_counted_trial()]))))
+        header, row = rows[0], rows[1]
+        for column in (
+            "tests_passed",
+            "tests_failed",
+            "tests_skipped",
+            "tests_total",
+            "test_report_source",
+        ):
+            assert row[header.index(column)] == ""
+
+
+class TestRunShowTestsColumn:
+    """`runs --show` gains a TESTS cell: mean passed / mean (total - skipped)."""
+
+    @staticmethod
+    def _view(metrics: TargetMetrics) -> RunShowView:
+        row = RunRowView(
+            run_id="run_1",
+            benchmark_id="rb_b_x",
+            status="COMPLETED",
+            started_at="2026-09-01T12:00:00",
+            finished_at="2026-09-01T12:30:00",
+            targets=1,
+            trials_done=10,
+            trials_solved=8,
+        )
+        return RunShowView(row=row, targets=[metrics])
+
+    @staticmethod
+    def _target_row_line(output: str, target_id: str) -> str:
+        return next(line for line in output.splitlines() if target_id in line)
+
+    def test_tests_cell_shows_passed_over_denominator(self, capsys):
+        metrics = make_target("claude", 0.8, p50_ms=558_000, cost_per_solve=1.5)
+        metrics = metrics.model_copy(
+            update={
+                "tests_mean_passed": 9.0,
+                "tests_mean_denominator": 12.0,
+                "tests_partial_n": 1,
+            }
+        )
+        render_run_show(self._view(metrics))
+        out = capsys.readouterr().out
+        assert "TESTS" in out
+        row_line = self._target_row_line(out, "claude")
+        assert "9/12" in row_line
+
+    def test_tests_cell_placeholder_without_data(self, capsys):
+        metrics = make_target("claude", 0.8, p50_ms=558_000, cost_per_solve=1.5)
+        render_run_show(self._view(metrics))
+        out = capsys.readouterr().out
+        assert "TESTS" in out
+        row_line = self._target_row_line(out, "claude")
+        assert "9/12" not in row_line
+        assert "—" in row_line  # the TESTS cell renders the None glyph

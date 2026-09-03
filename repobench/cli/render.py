@@ -26,8 +26,12 @@ MISS = "✗"
 WARN = "⚠"
 
 
-def echo(message: str = "") -> None:
+def echo(message: str = "", flush: bool = False) -> None:
     console.print(message, markup=False, highlight=False, soft_wrap=True)
+    # Piped stdout is block-buffered, so long-running steps must flush after
+    # each line or the user stares at silence until the process exits.
+    if flush:
+        sys.stdout.flush()
 
 
 def fail(message: str) -> None:
@@ -428,7 +432,9 @@ def render_run_summary(results: list) -> None:  # noqa: ANN001 - list[TrialResul
 
 
 def render_task_build_line(message: str) -> None:
-    echo(f"  {message}")
+    # flushed: benchmark builds take minutes per candidate, and piped output
+    # must still show each line the moment it is produced.
+    echo(f"  {message}", flush=True)
 
 
 # --------------------------------------------------------------- runs / clean
@@ -467,11 +473,22 @@ def render_run_show(view) -> None:  # noqa: ANN001 - RunShowView
         echo("(no trials recorded for this run)")
         return
     table = RichTable(header_style="bold")
-    for column in ("TARGET", "N", "SOLVED", "SOLVE RATE", "P50", "TIMEOUTS", "ERRORS"):
+    for column in ("TARGET", "N", "SOLVED", "SOLVE RATE", "TESTS", "P50", "TIMEOUTS", "ERRORS"):
         table.add_column(column)
 
     def duration(ms) -> str:  # noqa: ANN001
         return f"{ms / 1000:.0f}s" if ms is not None else "—"
+
+    def tests_cell(metrics) -> str:  # noqa: ANN001 - TargetMetrics
+        """Mean passed over mean (total - skipped); — when no trial carried
+        per-test counts — a number is never invented (PRD honesty rule)."""
+        if (
+            metrics.tests_partial_n == 0
+            or metrics.tests_mean_passed is None
+            or metrics.tests_mean_denominator is None
+        ):
+            return "—"
+        return f"{metrics.tests_mean_passed:.0f}/{metrics.tests_mean_denominator:.0f}"
 
     for metrics in view.targets:
         table.add_row(
@@ -479,6 +496,7 @@ def render_run_show(view) -> None:  # noqa: ANN001 - RunShowView
             str(metrics.n),
             str(metrics.solved),
             f"{metrics.solve_rate * 100:.0f}%",
+            tests_cell(metrics),
             duration(metrics.time_p50_ms),
             str(metrics.timeouts),
             str(metrics.errors),

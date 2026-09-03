@@ -152,6 +152,21 @@ def render_report(data: ReportData) -> str:
                 f"{metrics.wilson_lo * 100:.0f}%–{metrics.wilson_hi * 100:.0f}%"
             )
 
+    if any(m.tests_partial_n > 0 for m in data.targets):
+        # Partial credit (Onda 4): mean per-test ratio over the trials that
+        # carry hidden-verifier counts. The section is omitted entirely when no
+        # target has data; inside it, a target without data says so (— , n=0) —
+        # numbers are never invented and n is always visible.
+        lines.append("")
+        lines.append("Partial credit (hidden tests — mean passed/(total-skipped) over trials with data)")
+        lines.append("")
+        for metrics in data.targets:
+            if metrics.tests_partial_n > 0 and metrics.tests_partial is not None:
+                value = f"partial {metrics.tests_partial:.2f}"
+            else:
+                value = "—"
+            lines.append(f"  {metrics.target_id}: {value} (n={metrics.tests_partial_n} trials)")
+
     if data.pareto is not None and data.targets:
         lines.append("")
         lines.extend(_pareto_plot_lines(data))

@@ -109,6 +109,7 @@ project:
   install_command: uv sync --frozen
   test_command: python -m pytest
   regression_command: python -m pytest
+  # test_report: auto  # partial credit: per-test counts (passed/total) from the hidden verifier; "off" disables
   # cwd: backend  # monorepos: run the commands inside a sub-project (relative to the repo root)
 
 benchmark:
@@ -148,6 +149,9 @@ task package (`base.tar`, `instruction.md`, `gold.patch`, `verifier.patch`,
 no-op check), the hidden verifier must fail on the untouched base, must pass
 with the gold solution, must survive regression and determinism checks.
 Tasks that fail validation are rejected with stable codes — never silently kept.
+For pytest-shaped verifiers, counts of the hidden verifier's own tests (`TESTS
+9/12`) are recorded per trial as partial credit — a finding beside the verdict,
+never part of it.
 
 **A benchmark that represents your workload.** Validated tasks are sampled
 greedily so the benchmark's task-type/subsystem/complexity distribution matches

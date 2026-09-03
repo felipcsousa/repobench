@@ -307,7 +307,12 @@ class TrialResult(BaseModel):
     stdout_path: str | None = None
     stderr_path: str | None = None
     started_at: datetime | None = None
+    # Wall clock of the WHOLE trial (install + agent + verify), stamped at
+    # publish time — what Time/P50 must report. The harness-only figure lives
+    # in harness_ms; before it existed duration_ms measured just the agent
+    # phase and real-repo trials showed 0s beside minutes of verify time.
     duration_ms: int = 0
+    harness_ms: int | None = None
     exit_code: int | None = None
     timed_out: bool = False
     usage: UsageRecord | None = None
@@ -327,6 +332,16 @@ class TrialResult(BaseModel):
     # reward-hacking signal recorded as a finding, never folded into `error`
     # and never changing `outcome` (PRD §42: verifiers define correctness).
     tampered_tests: list[str] = Field(default_factory=list)
+    # Per-test counts of the HIDDEN verifier's tests — only testcases living in
+    # files the verifier patch touches (partial credit, Onda 4): a finding
+    # registered beside the verdict, never inside it. None across all five
+    # fields when the report was not extracted — numbers are never invented
+    # (same rule as tampered_tests).
+    tests_passed: int | None = None
+    tests_failed: int | None = None  # failures + errors
+    tests_skipped: int | None = None
+    tests_total: int | None = None  # convenience: passed + failed + skipped
+    test_report_source: str | None = None  # e.g. "pytest-junit"; None = not extracted
     prompt_path: str | None = None
     workspace: str | None = None
     error: str | None = None

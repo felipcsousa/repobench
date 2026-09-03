@@ -52,6 +52,14 @@ class TargetMetrics(pydantic.BaseModel):
     # every report (terminal and JSON) carries and renders the same interval.
     wilson_lo: float | None
     wilson_hi: float | None
+    # Partial credit (Onda 4): mean per-test ratio over the trials that carry
+    # hidden-verifier counts. Honesty rule (PRD): a number is never invented —
+    # when no trial reported counts every derived value stays None/0, and
+    # tests_partial_n always discloses how many trials back the mean.
+    tests_partial: float | None = None  # mean of passed/(total-skipped) per trial
+    tests_partial_n: int = 0  # trials contributing to the mean
+    tests_mean_passed: float | None = None  # mean of passed counts (same trials)
+    tests_mean_denominator: float | None = None  # mean of (total - skipped)
 
 
 def nearest_rank(sorted_values: Sequence[float], percentile: float) -> float | None:
@@ -100,6 +108,32 @@ def _aggregate_one(target_id: str, trials: list[TrialResult]) -> TargetMetrics:
 
     files_changed = [t.files_changed for t in trials if t.files_changed is not None]
 
+    # Partial credit (Onda 4): only trials carrying all four per-test counts are
+    # data; a fully-skipped suite (denominator = total - skipped <= 0) ran no
+    # real test and is excluded too. Missing data propagates to None — never
+    # invented into a mean (PRD honesty rule, same as cost/tokens above).
+    counted = [
+        t
+        for t in trials
+        if t.tests_passed is not None
+        and t.tests_failed is not None
+        and t.tests_skipped is not None
+        and t.tests_total is not None
+    ]
+    contributing = [t for t in counted if t.tests_total - t.tests_skipped > 0]
+    if contributing:
+        passed = [t.tests_passed for t in contributing]
+        denominators = [t.tests_total - t.tests_skipped for t in contributing]
+        tests_partial = sum(p / d for p, d in zip(passed, denominators)) / len(contributing)
+        tests_mean_passed = sum(passed) / len(contributing)
+        tests_mean_denominator = sum(denominators) / len(contributing)
+        tests_partial_n = len(contributing)
+    else:
+        tests_partial = None
+        tests_mean_passed = None
+        tests_mean_denominator = None
+        tests_partial_n = 0
+
     cost_per_solve = total_cost / solved if total_cost is not None and solved > 0 else None
     wilson_lo, wilson_hi = wilson_ci(solved, n)
 
@@ -123,6 +157,10 @@ def _aggregate_one(target_id: str, trials: list[TrialResult]) -> TargetMetrics:
         ),
         wilson_lo=wilson_lo,
         wilson_hi=wilson_hi,
+        tests_partial=tests_partial,
+        tests_partial_n=tests_partial_n,
+        tests_mean_passed=tests_mean_passed,
+        tests_mean_denominator=tests_mean_denominator,
     )
 
 

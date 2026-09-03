@@ -48,6 +48,11 @@ CSV_COLUMNS: tuple[str, ...] = (
     "loc_added",
     "loc_removed",
     "tampered_tests",
+    "tests_passed",
+    "tests_failed",
+    "tests_skipped",
+    "tests_total",
+    "test_report_source",
     "task.pr_number",
     "task.task_type",
     "task.subsystem",
@@ -103,6 +108,13 @@ def _export_row(trial: TrialResult, task: TaskMetadata | None) -> dict[str, Any]
         # issue #18: test files the agent's diff touched, `;`-joined (a finding,
         # independent of the outcome columns)
         "tampered_tests": ";".join(trial.tampered_tests),
+        # Partial credit (Onda 4): hidden-verifier per-test counts — findings
+        # beside the verdict; None stays an empty cell (never invented)
+        "tests_passed": trial.tests_passed,
+        "tests_failed": trial.tests_failed,
+        "tests_skipped": trial.tests_skipped,
+        "tests_total": trial.tests_total,
+        "test_report_source": trial.test_report_source,
     }
     if task is not None:
         row.update({f"task.{key}": value for key, value in _task_fields(task).items()})

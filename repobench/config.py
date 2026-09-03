@@ -6,6 +6,7 @@ import json
 import shlex
 import sys
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
@@ -50,6 +51,11 @@ class ProjectConfig(BaseModel):
             )
         self.cwd = rel.as_posix()
         return self
+
+    # Partial credit (Onda 4): "auto" appends --junitxml to a pytest-shaped task
+    # verifier to extract per-test counts (a finding beside the verdict, never in
+    # it); "off" keeps the verifier argv byte-identical to the configured command.
+    test_report: Literal["auto", "off"] = "auto"
 
 
 class TaskMiningConfig(BaseModel):
