@@ -249,13 +249,18 @@ def build_benchmark(
     *,
     size: int | None = None,
     reuse_valid: bool = False,
+    stop_when_sufficient: bool = False,
     log: ProgressFn | None = None,
 ) -> BenchmarkBuildOutcome:
     """Validate candidate tasks, sample a representative benchmark (PRD §88-89, §126).
 
     With reuse_valid (issue #16) candidates whose deterministic task_id already
     validated VALID and whose package still loads skip the five historical
-    validation checks; the leakage scan still runs and still gates."""
+    validation checks; the leakage scan still runs and still gates.
+
+    With stop_when_sufficient the loop breaks as soon as enough VALID tasks
+    cover the requested size — cheaper, but the sampling pool is smaller, so
+    distribution matching weakens (opt-in; the default validates everything)."""
     paths = project_paths(root)
     repo = GitRepo(root)
     candidates = storage.list_candidates()
@@ -295,9 +300,25 @@ def build_benchmark(
     # the loop below carries exactly one branch on it, never scattered conditionals.
     reusable = reusable_task_ids(storage, paths) if reuse_valid else set()
     reused_count = 0
+    requested = size if size is not None else cfg.benchmark.size
+    if log is not None:
+        # Cost warning before the slow step: each fresh candidate pays a full
+        # validation pass (install + every check), which is minutes of work.
+        warning = (
+            f"validating {len(pool)} candidate(s) — each fresh one runs install + "
+            "baseline/verifier/gold/regression checks; this is the slow step"
+        )
+        if reuse_valid:
+            warning += (
+                " (candidates already VALID from a previous build are reused, "
+                "not revalidated)"
+            )
+        log(warning)
     results: list[TaskBuildResult] = []
     reconstruction_rejected: list[CandidateInfo] = []
-    for candidate in pool:
+    for i, candidate in enumerate(pool, start=1):
+        if log is not None:
+            log(f"[{i}/{len(pool)}] PR #{candidate.pr.number}: validating…")
         try:
             package = _package_for(repo, candidate, paths)
         except ReconstructionError as exc:
@@ -359,6 +380,16 @@ def build_benchmark(
             else:
                 code = f" ({result.rejection_code.value})" if result.rejection_code else ""
                 log(f"PR #{pr}: {result.status.value}{code}")
+        if stop_when_sufficient:
+            valid_count = sum(1 for r in results if r.status is TaskStatus.VALID)
+            if valid_count >= requested:
+                if log is not None:
+                    log(
+                        f"stopping early: {valid_count} valid task(s) cover size "
+                        f"{requested} — {len(pool) - i} candidate(s) left "
+                        "unvalidated; smaller sampling pool"
+                    )
+                break
 
     valid = [r for r in results if r.status is TaskStatus.VALID]
     if not valid:
@@ -380,7 +411,6 @@ def build_benchmark(
             "checks with output tails (issue #35)."
         )
 
-    requested = size if size is not None else cfg.benchmark.size
     metadatas = [r.package.metadata for r in valid]
     sample = greedy_stratified_sample(metadatas, requested, cfg.benchmark.dimensions)
 
@@ -510,6 +540,7 @@ def refresh_benchmark(
     size: int | None = None,
     reuse_valid: bool = False,
     force_revalidate: bool = False,
+    stop_when_sufficient: bool = False,
     log: ProgressFn | None = None,
 ) -> RefreshOutcome:
     """Re-mine the repo, measure the stored benchmark's drift and rebuild (issue
@@ -547,6 +578,7 @@ def refresh_benchmark(
         storage,
         size=size or manifest.size,
         reuse_valid=reuse_valid and not force_revalidate,
+        stop_when_sufficient=stop_when_sufficient,
         log=log,
     )
     new_ids = [meta.task_id for meta in build.sample]

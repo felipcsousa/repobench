@@ -17,7 +17,10 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 benchmark_app = typer.Typer(help="Benchmark construction and inspection.", no_args_is_help=True)
-targets_app = typer.Typer(help="Execution target management.", no_args_is_help=True)
+targets_app = typer.Typer(
+    help="Execution target management (targets live in repobench.yml — `add` writes them for you).",
+    no_args_is_help=True,
+)
 app.add_typer(benchmark_app, name="benchmark")
 app.add_typer(targets_app, name="targets")
 
@@ -392,6 +395,16 @@ def benchmark_build(
             "with --reuse-valid."
         ),
     ),
+    stop_when_sufficient: bool = typer.Option(
+        False,
+        "--stop-when-sufficient",
+        help=(
+            "Stop validating as soon as enough tasks are VALID for the requested "
+            "size. Trade-off: the remaining candidates stay unvalidated, so the "
+            "sampling pool is smaller and distribution matching is weaker. "
+            "Default: every candidate is validated."
+        ),
+    ),
 ) -> None:
     """Validate tasks and sample a representative benchmark (PRD §88-89)."""
     from repobench.cli import render
@@ -409,6 +422,7 @@ def benchmark_build(
             storage,
             size=size,
             reuse_valid=reuse_valid and not force_revalidate,
+            stop_when_sufficient=stop_when_sufficient,
             log=render.render_task_build_line,
         )
     except RepoBenchError as exc:
@@ -445,6 +459,17 @@ def benchmark_refresh(
             "with --reuse-valid (same precedence as `benchmark build`)."
         ),
     ),
+    stop_when_sufficient: bool = typer.Option(
+        False,
+        "--stop-when-sufficient",
+        help=(
+            "Stop validating as soon as enough tasks are VALID for the requested "
+            "size. Trade-off: the remaining candidates stay unvalidated, so the "
+            "sampling pool is smaller and distribution matching is weaker. "
+            "Default: every candidate is validated (same semantics as "
+            "`benchmark build`)."
+        ),
+    ),
 ) -> None:
     """Re-measure benchmark drift against the evolving repo and rebuild (issue #15, PRD §148)."""
     from repobench.cli import render
@@ -463,6 +488,7 @@ def benchmark_refresh(
             benchmark_id=benchmark,
             size=size,
             reuse_valid=reuse_valid and not force_revalidate,
+            stop_when_sufficient=stop_when_sufficient,
             log=render.render_task_build_line,
         )
     except RepoBenchError as exc:
@@ -491,6 +517,73 @@ def targets_list(ctx: typer.Context) -> None:
         render.echo("no targets configured — add them to repobench.yml")
         return
     render.render_targets_table(cfg)
+
+
+@targets_app.command("add")
+def targets_add(
+    ctx: typer.Context,
+    target_id: str = typer.Argument(..., help="Target id (used as `repobench run <id>`)."),
+    harness: str = typer.Option("command", help="claude | codex | opencode | gemini | command."),
+    model: Optional[str] = typer.Option(None, help="Model name for the harness."),
+    provider: Optional[str] = typer.Option(None, help="Provider label."),
+    command: list[str] = typer.Option(
+        None,
+        "--command",
+        help=(
+            "One argv token; repeat the flag for each (harness=command). "
+            "Placeholders: {workspace} {prompt} {prompt_file} {task_id} {target_id}."
+        ),
+    ),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing target with this id."),
+) -> None:
+    """Add an execution target to repobench.yml (PRD §93)."""
+    from repobench.cli import render
+    from repobench.cli.services import validate_targets
+    from repobench.config import CONFIG_FILENAME
+    from repobench.core.errors import RepoBenchError
+    from repobench.core.types import ExecutionTarget
+    from repobench.execution.adapters.registry import get_adapter
+
+    try:
+        root, _paths, cfg, _storage = _service_context(ctx)
+        # Harness check first — the registry's UsageError already lists the
+        # known harnesses, so let it travel to _fail untouched.
+        adapter = get_adapter(harness)
+        target = ExecutionTarget(
+            id=target_id,
+            harness=adapter.name,
+            model=model,
+            provider=provider,
+            command=list(command) if command else None,
+        )
+        validate_targets([target])
+    except RepoBenchError as exc:
+        _fail(str(exc))
+        return
+
+    if target_id in cfg.targets and not force:
+        _fail(
+            f"target {target_id!r} already exists — pass --force to overwrite it"
+        )
+        return
+    cfg.targets[target_id] = target
+    cctx: CliContext = ctx.obj
+    explicit = (
+        cctx.config_path
+        if cctx.config_path and cctx.config_path.name != CONFIG_FILENAME
+        else None
+    )
+    config_path = explicit if explicit is not None else root / CONFIG_FILENAME
+    config_path.write_text(cfg.to_yaml())
+
+    render.echo(f"✓ target {target_id} (harness: {target.harness}) saved")
+    render.echo(
+        f"note: {config_path} was rewritten from the parsed config — "
+        "formatting is normalized and comments are not preserved"
+    )
+    if target.harness == "command":
+        render.echo("custom command targets need --trust-custom-command on first run")
+    render.echo(f"Next: repobench run {target_id}")
 
 
 @targets_app.command("validate")

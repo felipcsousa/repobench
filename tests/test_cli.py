@@ -208,6 +208,80 @@ def test_targets_validate_rejects_command_target_without_command(fixture_repo: P
     assert "invalid" in result.output
 
 
+# ----------------------------------------------------------------- targets add
+
+
+def test_targets_add_writes_command_target_to_yml(fixture_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(fixture_repo)
+    _write_config(fixture_repo)
+    result = _invoke(
+        "targets",
+        "add",
+        "stub",
+        "--harness",
+        "command",
+        "--command",
+        "python",
+        "--command",
+        "fake_agent.py",
+    )
+    assert result.exit_code == 0, result.output
+    assert "Next: repobench run stub" in result.output
+    assert "rewritten" in result.output  # the yml was re-serialized
+    assert "--trust-custom-command" in result.output  # the PRD §26 gate reminder
+    cfg = RepoBenchConfig.load(fixture_repo / "repobench.yml")
+    assert cfg.targets["stub"].harness == "command"
+    assert cfg.targets["stub"].command == ["python", "fake_agent.py"]
+
+
+def test_targets_add_refuses_duplicate_id_without_force(fixture_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(fixture_repo)
+    _write_config(fixture_repo, glm=ExecutionTarget(harness="opencode", model="zai/glm-x"))
+    refused = _invoke("targets", "add", "glm", "--harness", "codex")
+    assert refused.exit_code == 1
+    assert "--force" in refused.output
+    cfg = RepoBenchConfig.load(fixture_repo / "repobench.yml")
+    assert cfg.targets["glm"].harness == "opencode"  # untouched
+
+    forced = _invoke("targets", "add", "glm", "--harness", "codex", "--force")
+    assert forced.exit_code == 0, forced.output
+    cfg = RepoBenchConfig.load(fixture_repo / "repobench.yml")
+    assert cfg.targets["glm"].harness == "codex"
+
+
+def test_targets_add_unknown_harness_lists_known_ones(fixture_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(fixture_repo)
+    _write_config(fixture_repo)
+    result = _invoke("targets", "add", "nope", "--harness", "cursor")
+    assert result.exit_code == 1
+    assert "unknown harness" in result.output
+    for known in ("claude", "codex", "opencode", "gemini", "command"):
+        assert known in result.output
+    assert "nope" not in RepoBenchConfig.load(fixture_repo / "repobench.yml").targets
+
+
+def test_targets_add_command_harness_requires_command(fixture_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(fixture_repo)
+    _write_config(fixture_repo)
+    result = _invoke("targets", "add", "broken", "--harness", "command")
+    assert result.exit_code == 1
+    assert "invalid" in result.output  # structural validation catches it
+    assert "broken" not in RepoBenchConfig.load(fixture_repo / "repobench.yml").targets
+
+
+def test_targets_add_harness_target_needs_no_command(fixture_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(fixture_repo)
+    _write_config(fixture_repo)
+    result = _invoke(
+        "targets", "add", "fast", "--harness", "codex", "--model", "gpt-5.3-codex"
+    )
+    assert result.exit_code == 0, result.output
+    target = RepoBenchConfig.load(fixture_repo / "repobench.yml").targets["fast"]
+    assert target.harness == "codex"
+    assert target.model == "gpt-5.3-codex"
+    assert target.command is None
+
+
 # ----------------------------------------------------------------- candidates
 
 
@@ -299,6 +373,23 @@ def test_benchmark_build_before_analyze_exits_one(
     assert "no task candidates to validate" in built.output
 
 
+def test_benchmark_build_logs_cost_warning_and_candidate_progress(
+    fixture_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The persona test: a build must say how much work is coming and announce
+    each candidate BEFORE spending minutes validating it."""
+    monkeypatch.chdir(fixture_repo)
+    _hermetic_verifier_config(fixture_repo)
+    assert _invoke("analyze").exit_code == 0
+    built = _invoke("benchmark", "build")
+    assert built.exit_code == 0, built.output
+    # cost warning before the loop (fixture pool: PR #7 only — PR #8 is FILTERED)
+    assert "validating 1 candidate(s)" in built.output
+    assert "this is the slow step" in built.output
+    # 1-based per-candidate progress line, emitted before the candidate's work
+    assert "[1/1] PR #7: validating…" in built.output
+
+
 def test_benchmark_refresh_without_benchmark_exits_one(
     fixture_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -373,3 +464,108 @@ def test_candidates_show_unknown_pr_is_a_usage_error(
     shown = _invoke("candidates", "--show", "42")
     assert shown.exit_code == 1, shown.output
     assert "no candidate recorded for PR #42" in shown.output
+
+
+# ------------------------------------------------- build early-stop (unit test)
+
+
+def test_build_benchmark_stop_when_sufficient_stops_after_enough_valid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--stop-when-sufficient (opt-in): the validation loop breaks as soon as
+    enough VALID tasks cover the requested size; the default validates all."""
+    import tarfile
+
+    from repobench.cli import builds
+    from repobench.cli.builds import build_benchmark
+    from repobench.core.types import (
+        Assessment,
+        CandidateInfo,
+        PRInfo,
+        TaskMetadata,
+        TaskPackage,
+        TaskStatus,
+        TaskType,
+    )
+    from repobench.validation._shared import CheckResult
+    from repobench.validation.pipeline import TaskValidationReport
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    # GitRepo only needs the .git directory (nothing is mined here; the
+    # synthetic candidates below are persisted straight into storage).
+    git(repo_root, "init", "--quiet", "--initial-branch=main")
+
+    def candidate(n: int) -> CandidateInfo:
+        return CandidateInfo(
+            candidate_id=f"c{n}",
+            pr=PRInfo(number=n, title=f"PR {n}"),
+            assessment=Assessment(
+                task_type=TaskType.BUGFIX, subsystem=f"mod{n}"
+            ),
+        )
+
+    storage = Storage(tmp_path / "state.db")
+    for n in (1, 2, 3):
+        storage.save_candidate(candidate(n))
+
+    packages_root = tmp_path / "packages"
+
+    def fake_package_for(repo, cand, paths):  # noqa: ANN001 - test double
+        directory = packages_root / cand.candidate_id
+        directory.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(directory / "base.tar", "w"):
+            pass  # empty archive — the leakage scan finds nothing, score clears
+        metadata = TaskMetadata(
+            task_id=f"task-{cand.pr.number}",
+            base_sha="b" * 40,
+            gold_sha="g" * 40,
+            pr_number=cand.pr.number,
+            assessment=cand.assessment,
+        )
+        return TaskPackage(task_id=metadata.task_id, directory=directory, metadata=metadata)
+
+    calls: list[str] = []
+
+    class FakeValidator:
+        def __init__(self, project, workspaces_root) -> None:  # noqa: ANN001
+            pass
+
+        def validate(self, package, *, leakages=None):  # noqa: ANN001
+            calls.append(package.task_id)
+            return TaskValidationReport(
+                task_id=package.task_id,
+                status=TaskStatus.VALID,
+                rejection_code=None,
+                checks=[CheckResult(name="fake", passed=True, code=None, details="ok")],
+            )
+
+    monkeypatch.setattr(builds, "_package_for", fake_package_for)
+    monkeypatch.setattr(builds, "TaskValidator", FakeValidator)
+
+    cfg = RepoBenchConfig()
+    cfg.project = ProjectConfig(
+        language="python", test_command="true", regression_command="true"
+    )
+
+    # early stop ON: one VALID task covers size 1 — candidates 2 and 3 never run
+    calls.clear()
+    lines: list[str] = []
+    outcome = build_benchmark(
+        repo_root, cfg, storage, size=1, stop_when_sufficient=True, log=lines.append
+    )
+    assert calls == ["task-1"]
+    assert len(outcome.valid) == 1
+    assert len(outcome.sample) == 1
+    stopping = [line for line in lines if "stopping early" in line]
+    assert len(stopping) == 1
+    assert "1 valid task(s) cover size 1" in stopping[0]
+    assert "2 candidate(s) left unvalidated" in stopping[0]
+
+    # default OFF: every candidate is validated (current methodology untouched)
+    calls.clear()
+    lines_default: list[str] = []
+    outcome_all = build_benchmark(repo_root, cfg, storage, size=1, log=lines_default.append)
+    assert calls == ["task-1", "task-2", "task-3"]
+    assert len(outcome_all.valid) == 3
+    assert not any("stopping early" in line for line in lines_default)
