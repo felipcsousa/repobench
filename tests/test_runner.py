@@ -567,6 +567,10 @@ def _mono_diagnosis(result, task: TaskPackage) -> str:  # noqa: ANN001
     ws = Path(result.workspace) if result.workspace else None
     if ws is None or not ws.is_dir():
         return "\n".join(lines + [f"workspace gone: {result.workspace}"])
+    for label, artifact in (("harness stdout", result.stdout_path), ("harness stderr", result.stderr_path)):
+        path = Path(artifact) if artifact else None
+        tail = path.read_text(errors="replace")[-800:] if path and path.is_file() else "(missing)"
+        lines.append(f"{label} tail:\n{tail}")
     calc = ws / "backend" / "calculator.py"
     lines.append(f"calculator.py bytes: {calc.read_bytes() if calc.is_file() else '(missing)'}")
     lines.append(f"install marker: {(ws / 'backend' / 'install_marker.txt').is_file()}")
