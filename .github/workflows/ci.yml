@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    name: tests · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      # See every platform's failures in one run instead of cancelling the rest.
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync environment
+        # --frozen honors uv.lock; the dev dependency-group (pytest,
+        # pytest-asyncio) is installed by default. uv fetches a managed
+        # Python >=3.12 when the runner lacks one.
+        run: uv sync --frozen
+      - name: Run test suite
+        run: uv run pytest tests/ -q

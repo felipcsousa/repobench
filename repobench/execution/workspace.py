@@ -7,6 +7,7 @@ history and would leak the solution.
 
 from __future__ import annotations
 
+import logging
 import shutil
 import tarfile
 from pathlib import Path
@@ -14,6 +15,8 @@ from pathlib import Path
 from repobench.core.errors import RepoBenchError
 from repobench.core.testpaths import is_test_path
 from repobench.execution.process import run_sync
+
+_LOG = logging.getLogger("repobench.execution.workspace")
 
 SYNTHETIC_BASE_COMMIT_MESSAGE = "RepoBench benchmark base"
 _GIT_IDENTITY = ("-c", "user.name=RepoBench", "-c", "user.email=repobench@localhost")
@@ -110,22 +113,19 @@ def diff_stats(diff_text: str) -> tuple[int, int, int]:
     return files, added, removed
 
 
-def tampered_test_paths(diff_text: str) -> list[str]:
-    """Repo-relative test paths a unified diff touches (issue #18).
+def diff_touched_paths(diff_text: str) -> set[str]:
+    """Repo-relative paths a unified diff touches, test files or not.
 
-    Parses the exact text capture_agent_patch writes to agent.patch. Every path
-    mentioned in a `diff --git`, `---`/`+++`, rename or copy header counts — a
-    test file the agent deletes or renames is tampering just as much as one it
-    edits, so the +++ line alone is not enough. Returns sorted, de-duplicated
-    paths; an empty or unparseable diff yields [] — detection degrades to off,
-    it never false-accuses.
+    Every path mentioned in a `diff --git`, `---`/`+++`, rename or copy header
+    counts — the `+++` line alone misses pure renames. Returns de-duplicated
+    paths; an empty or unparseable diff yields an empty set.
     """
     paths: set[str] = set()
     for line in diff_text.splitlines():
         if line.startswith("diff --git "):
             # "diff --git a/<old> b/<new>" — split on the " b/" join so both
             # sides count: a pure rename carries no ---/+++ lines at all.
-            rest = line[len("diff --git "):]
+            rest = line[len("diff --git ") :]
             if rest.startswith("a/") and " b/" in rest:
                 old, new = rest[2:].split(" b/", 1)
                 paths.update((old, new))
@@ -135,7 +135,18 @@ def tampered_test_paths(diff_text: str) -> list[str]:
                 paths.add(target[2:])
         elif line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
             paths.add(line.split(" ", 2)[2])
-    return sorted({p for p in paths if p and p != "/dev/null" and is_test_path(p)})
+    return {p for p in paths if p and p != "/dev/null"}
+
+
+def tampered_test_paths(diff_text: str) -> list[str]:
+    """Repo-relative test paths a unified diff touches (issue #18).
+
+    Parses the exact text capture_agent_patch writes to agent.patch; detection
+    is limited to test paths, a deletion or rename counts as much as an edit,
+    and an unparseable diff yields [] — detection degrades to off, it never
+    false-accuses.
+    """
+    return sorted(p for p in diff_touched_paths(diff_text) if is_test_path(p))
 
 
 def capture_agent_patch(repo_dir: Path, out_file: Path) -> tuple[int, int, int, list[str]]:
@@ -155,10 +166,23 @@ def capture_agent_patch(repo_dir: Path, out_file: Path) -> tuple[int, int, int, 
 
 def snapshot_tree(source_repo_dir: Path, dest_dir: Path) -> Path:
     """Copy the final agent tree (minus .git) into a fresh verification workspace with
-    its own synthetic git repo, so verifier runs never mutate the agent's workspace (PRD §62)."""
+    its own synthetic git repo, so verifier runs never mutate the agent's workspace (PRD §62).
+
+    Symlinks are preserved, never dereferenced: virtualenvs created inside the
+    workspace (uv/pip) point `bin/python` at an interpreter outside the tree, and a
+    copied binary no longer resolves its libpython rpath — the forkclaw field test
+    crashed on exactly that (dyld: Library not loaded). Dereferencing remains as a
+    fallback for platforms that refuse symlink creation without privileges (Windows
+    outside Developer Mode), where a usable-but-dereferenced snapshot beats a crash."""
     if dest_dir.exists():
         shutil.rmtree(dest_dir)
-    shutil.copytree(source_repo_dir, dest_dir, ignore=shutil.ignore_patterns(".git"))
+    ignore = shutil.ignore_patterns(".git")
+    try:
+        shutil.copytree(source_repo_dir, dest_dir, ignore=ignore, symlinks=True)
+    except OSError as exc:
+        _LOG.warning("verify snapshot: symlinks not preservable (%s); dereferencing", exc)
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        shutil.copytree(source_repo_dir, dest_dir, ignore=ignore)
     _init_synthetic_git(dest_dir)
     return dest_dir
 
