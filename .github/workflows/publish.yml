@@ -1,0 +1,39 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    name: publish · PyPI
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Read-only is enough: PyPI auth goes through UV_PUBLISH_TOKEN,
+      # not through the GitHub token.
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Verify release tag matches pyproject version
+        # Publishing a tag that disagrees with pyproject.toml would upload
+        # artifacts under a version other than the one the release announces,
+        # so fail fast before building anything.
+        # The tag is passed via env (not interpolated into the command) to
+        # avoid shell injection from the release event payload.
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          uv run python -c "import os, sys, tomllib; tag = os.environ['RELEASE_TAG'].removeprefix('v'); version = tomllib.load(open('pyproject.toml', 'rb'))['project']['version']; sys.exit('Release tag ' + os.environ['RELEASE_TAG'] + ' (version ' + tag + ') does not match pyproject.toml version ' + version + ' — bump pyproject.toml or fix the tag') if tag != version else print('Release tag', tag, 'matches pyproject.toml version', version)"
+      - name: Build distributions
+        run: uv build
+      - name: Publish to PyPI
+        # Token is injected via environment (UV_PUBLISH_TOKEN) instead of a
+        # --token flag so the secret never appears in logs or process lists.
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish
