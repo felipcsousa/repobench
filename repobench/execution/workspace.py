@@ -8,7 +8,9 @@ history and would leak the solution.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
+import stat
 import tarfile
 from pathlib import Path
 
@@ -38,6 +40,17 @@ def _init_synthetic_git(repo_dir: Path) -> None:
     r = _git(repo_dir, "init", "--quiet", "--initial-branch=main")
     if r.exit_code != 0:
         raise RuntimeError(f"git init failed in {repo_dir}: {r.stderr.strip()}")
+    # Pin line-ending conversion OFF for the trial repo (local config wins over
+    # system/global for every git command touching this repo — harness included,
+    # even under the scrubbed trial env's GIT_CONFIG_NOSYSTEM/empty global).
+    # Without the pin, a machine with core.autocrlf=true stores the base commit
+    # cleaned to LF while the harness's git sees autocrlf=false and commits the
+    # CRLF working tree back — untouched files then appear as whole-file diffs
+    # in agent.patch (files_changed/loc counts inflated, tamper detection noise).
+    # Byte-exact storage keeps patch stats faithful on every platform.
+    cfg = _git(repo_dir, "config", "core.autocrlf", "false")
+    if cfg.exit_code != 0:
+        raise RuntimeError(f"git config failed in {repo_dir}: {cfg.stderr.strip()}")
     _git(repo_dir, "add", "-A")
     r = _git(
         repo_dir,
@@ -51,6 +64,19 @@ def _init_synthetic_git(repo_dir: Path) -> None:
         raise RuntimeError(f"synthetic base commit failed in {repo_dir}: {r.stderr.strip()}")
 
 
+def force_rmtree(path: Path) -> None:
+    """rmtree that clears the read-only bit and retries: git writes objects (and
+    pack files) read-only, and on Windows a read-only entry makes shutil.rmtree
+    fail — with ignore_errors the workspace would silently survive its own
+    destroy. Raises when the tree truly cannot be removed (never silent)."""
+
+    def _clear_readonly(func, target, _exc_info):
+        os.chmod(target, stat.S_IWRITE)
+        func(target)
+
+    shutil.rmtree(path, onexc=_clear_readonly)
+
+
 class WorkspaceManager:
     """Creates and destroys per-trial workspaces under .repobench/workspaces/."""
 
@@ -62,7 +88,7 @@ class WorkspaceManager:
         trial_dir = self.workspaces_dir / trial_id
         repo_dir = trial_dir / "repo"
         if repo_dir.exists():
-            shutil.rmtree(repo_dir)
+            force_rmtree(repo_dir)
         repo_dir.mkdir(parents=True)
         try:
             with tarfile.open(base_archive) as tar:
@@ -80,7 +106,7 @@ class WorkspaceManager:
     def destroy(self, ws: Workspace) -> None:
         if self.keep:
             return
-        shutil.rmtree(ws.base_dir, ignore_errors=True)
+        force_rmtree(ws.base_dir)
 
 
 def verify_synthetic_invariants(repo_dir: Path) -> list[str]:
@@ -175,13 +201,13 @@ def snapshot_tree(source_repo_dir: Path, dest_dir: Path) -> Path:
     fallback for platforms that refuse symlink creation without privileges (Windows
     outside Developer Mode), where a usable-but-dereferenced snapshot beats a crash."""
     if dest_dir.exists():
-        shutil.rmtree(dest_dir)
+        force_rmtree(dest_dir)
     ignore = shutil.ignore_patterns(".git")
     try:
         shutil.copytree(source_repo_dir, dest_dir, ignore=ignore, symlinks=True)
     except OSError as exc:
         _LOG.warning("verify snapshot: symlinks not preservable (%s); dereferencing", exc)
-        shutil.rmtree(dest_dir, ignore_errors=True)
+        force_rmtree(dest_dir)
         shutil.copytree(source_repo_dir, dest_dir, ignore=ignore)
     _init_synthetic_git(dest_dir)
     return dest_dir

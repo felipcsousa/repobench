@@ -35,7 +35,14 @@ def _kill_group(pid: int, sig: int) -> None:
     # Each trial runs in its own process group so harness-spawned children
     # (shells, MCP servers, test runners) die with it (PRD §40).
     try:
-        os.killpg(os.getpgid(pid), sig)
+        if sys.platform == "win32":
+            # Windows has no process groups: os.killpg/os.getpgid do not exist
+            # there (AttributeError). Kill only the main process — reaping
+            # children in a group would need Job Objects, which the runner does
+            # not manage (documented platform limitation).
+            os.kill(pid, sig)
+        else:
+            os.killpg(os.getpgid(pid), sig)
     except (ProcessLookupError, PermissionError, OSError):
         try:
             os.kill(pid, sig)
@@ -108,7 +115,9 @@ async def run_process(spec: CommandSpec) -> ProcessResult:
         try:
             await asyncio.wait_for(proc.wait(), timeout=TERMINATE_GRACE_SECONDS)
         except asyncio.TimeoutError:
-            _kill_group(proc.pid, signal.SIGKILL)
+            # SIGKILL does not exist on Windows; SIGTERM already maps to
+            # TerminateProcess there, so the fallback signal is platform-safe.
+            _kill_group(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
             await proc.wait()
 
     async def _collect(task: asyncio.Task | None) -> bytes:
@@ -179,7 +188,7 @@ def run_sync(
         try:
             out, err = proc.communicate(timeout=TERMINATE_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
-            _kill_group(proc.pid, signal.SIGKILL)
+            _kill_group(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
             out, err = proc.communicate()
 
     duration_ms = int((time.monotonic() - start) * 1000)

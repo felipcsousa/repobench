@@ -58,7 +58,9 @@ from pathlib import Path
 
 ws = Path(sys.argv[1])
 p = ws / "calculator.py"
-p.write_text(p.read_text().replace("x % 2 == 1", "x % 2 == 0"))
+# Byte-exact edit: read_text/write_text would translate newlines (and depend on
+# the locale codec) differently per platform, corrupting the fixture on Windows.
+p.write_bytes(p.read_bytes().replace(b"x % 2 == 1", b"x % 2 == 0"))
 print("fixed sum_even")
 """
 
@@ -91,7 +93,8 @@ from pathlib import Path
 
 ws = Path(sys.argv[1])
 p = ws / "calculator.py"
-p.write_text(p.read_text().replace("x % 2 == 1", "x % 2 == 0"))
+# Byte-exact edit (see FIX_AGENT): no newline/codec translation.
+p.write_bytes(p.read_bytes().replace(b"x % 2 == 1", b"x % 2 == 0"))
 git = ["git", "-c", "user.name=agent", "-c", "user.email=agent@example.com"]
 subprocess.run([*git, "add", "-A"], cwd=ws, check=True)
 subprocess.run([*git, "commit", "--quiet", "-m", "fix sum_even"], cwd=ws, check=True)
@@ -316,7 +319,10 @@ async def test_execute_missing_harness_binary_is_setup_error(tmp_path: Path) -> 
     # spawn failure is detected through the typed ProcessResult.spawn_error field
     assert result.outcome == TrialOutcome.SETUP_ERROR
     assert "harness could not be started" in (result.error or "")
-    assert str(missing) in (result.error or "")
+    if sys.platform != "win32":
+        # POSIX spawn errors carry the binary path; Windows' "[WinError 2] The
+        # system cannot find the file specified" does not name it.
+        assert str(missing) in (result.error or "")
     assert result.exit_code is None
     assert result.task_verified is None
     assert not (tmp_path / "workspaces" / result.trial_id).exists()
@@ -487,7 +493,8 @@ ws = Path(sys.argv[1])
 # see the whole repo even when project.cwd points the verifiers at backend/.
 assert (ws / "backend" / "calculator.py").is_file(), "harness cwd must be the repo root"
 p = ws / "backend" / "calculator.py"
-p.write_text(p.read_text().replace("x % 2 == 1", "x % 2 == 0"))
+# Byte-exact edit (see FIX_AGENT): no newline/codec translation.
+p.write_bytes(p.read_bytes().replace(b"x % 2 == 1", b"x % 2 == 0"))
 print("fixed backend sum_even")
 """
 

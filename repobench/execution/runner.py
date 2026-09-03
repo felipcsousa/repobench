@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import shlex
-import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -60,6 +59,7 @@ from repobench.execution.workspace import (
     apply_git_patch,
     capture_agent_patch,
     diff_touched_paths,
+    force_rmtree,
     snapshot_tree,
     verify_synthetic_invariants,
 )
@@ -230,7 +230,7 @@ class TrialExecutor:
         try:
             ws = self.workspaces.create(trial_id, task.task_id, task.base_tar)
         except Exception as exc:
-            shutil.rmtree(self.workspaces.workspaces_dir / trial_id, ignore_errors=True)
+            force_rmtree(self.workspaces.workspaces_dir / trial_id)
             return self._finish(
                 TrialResult(
                     **base,
@@ -245,7 +245,7 @@ class TrialExecutor:
         # exactly the synthetic base commit, with no remotes and no original branches.
         violations = verify_synthetic_invariants(ws.repo_dir)
         if violations:
-            shutil.rmtree(self.workspaces.workspaces_dir / trial_id, ignore_errors=True)
+            force_rmtree(self.workspaces.workspaces_dir / trial_id)
             ctx["ws"] = None
             return self._finish(
                 TrialResult(

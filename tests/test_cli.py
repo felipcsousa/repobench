@@ -133,7 +133,10 @@ def test_doctor_surfaces_subprojects_and_monorepo_hint(
     assert "JavaScript/TypeScript" in result.output
     assert "↳ backend" in result.output
     assert "Python" in result.output
-    assert "python -m pytest" in result.output
+    # The doctor suggests the interpreter running RepoBench (shlex.quoted), so on
+    # Windows the line reads '<path>\python.exe' -m pytest — assert the pytest
+    # intent, not the POSIX spelling.
+    assert "-m pytest" in result.output
     assert "project.cwd" in result.output  # the monorepo hint names the knob
 
 

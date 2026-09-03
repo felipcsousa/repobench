@@ -199,7 +199,10 @@ def test_project_cwd_validation() -> None:
     assert ProjectConfig(cwd="backend").cwd == "backend"
     assert ProjectConfig(cwd="backend/sub/").cwd == "backend/sub"  # normalized, POSIX
     assert ProjectConfig(cwd="./api").cwd == "api"
-    for bad in ("/absolute/path", "../outside", "a/../../b", "   ", ""):
+    # Absolute means platform-absolute: "/x" has no drive under Windows path
+    # semantics (is_absolute() is False there), so use a drive path on win32.
+    absolute = r"C:\absolute\path" if sys.platform == "win32" else "/absolute/path"
+    for bad in (absolute, "../outside", "a/../../b", "   ", ""):
         with pytest.raises(ValidationError):
             ProjectConfig(cwd=bad)
 
@@ -268,6 +271,12 @@ def test_run_sync_timeout_kills_group(tmp_path: Path) -> None:
     )
     r = run_sync([sys.executable, "-c", script], cwd=tmp_path, timeout_seconds=2)
     assert r.timed_out and r.exit_code is None
+    if sys.platform == "win32":
+        # Windows has no process groups: only the main process is killed
+        # (documented limitation in process._kill_group — no Job Objects), so
+        # the orphaned child intentionally survives there. No meaningful
+        # assertion is possible for it on this platform.
+        return
     # the orphaned child spawned inside the group must be dead too
     pid = int((tmp_path / "child.pid").read_text())
     with pytest.raises(ProcessLookupError):

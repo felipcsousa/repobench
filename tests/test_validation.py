@@ -38,7 +38,10 @@ from repobench.validation.oracle import check_oracle
 from repobench.validation.pipeline import TaskValidator, TaskValidationReport
 from repobench.validation.regression import check_regression
 
-PYTEST_CMD = f"{sys.executable} -m pytest -q"
+# Quoted interpreter: commands go through shlex.split (POSIX mode), which would
+# consume the backslashes of a Windows path (C:\Users\... -> C:Users...) and
+# spawn-fail every verifier (the pattern tests/test_runner.py already uses).
+PYTEST_CMD = f'"{sys.executable}" -m pytest -q'
 
 
 def make_task(tmp_path: Path, **repo_kwargs) -> TaskPackage:
@@ -129,7 +132,7 @@ def test_pipeline_without_test_command_cannot_be_valid(tmp_path: Path) -> None:
 
 def test_pipeline_install_failure_is_inconclusive(tmp_path: Path) -> None:
     task = make_task(tmp_path)
-    project = make_project(install_command=f'{sys.executable} -c "import sys; sys.exit(3)"')
+    project = make_project(install_command=f'"{sys.executable}" -c "import sys; sys.exit(3)"')
     report = TaskValidator(project, workspaces_root=tmp_path / "ws").validate(task)
 
     assert report.status == TaskStatus.REJECTED
@@ -142,7 +145,7 @@ def test_pipeline_install_failure_is_inconclusive(tmp_path: Path) -> None:
 
 def test_pipeline_verifier_exit_2_is_inconclusive(tmp_path: Path) -> None:
     task = make_task(tmp_path)
-    project = make_project(test_command=f'{sys.executable} -c "import sys; sys.exit(2)"')
+    project = make_project(test_command=f'"{sys.executable}" -c "import sys; sys.exit(2)"')
     report = TaskValidator(project, workspaces_root=tmp_path / "ws").validate(task)
 
     assert report.status == TaskStatus.REJECTED
@@ -204,7 +207,7 @@ def test_check_baseline_passes_on_healthy_base(tmp_path: Path) -> None:
 def test_check_baseline_broken(tmp_path: Path) -> None:
     task = make_task(tmp_path)
     project = make_project(
-        regression_command=f'{sys.executable} -c "import sys; sys.exit(1)"'
+        regression_command=f'"{sys.executable}" -c "import sys; sys.exit(1)"'
     )
     result = check_baseline(task, project, workspaces_root=tmp_path / "ws")
     assert result.passed is False
@@ -239,7 +242,7 @@ def test_check_oracle_gold_fails(tmp_path: Path) -> None:
 
 def test_check_install_failure_is_inconclusive(tmp_path: Path) -> None:
     task = make_task(tmp_path)
-    project = make_project(install_command=f'{sys.executable} -c "import sys; sys.exit(3)"')
+    project = make_project(install_command=f'"{sys.executable}" -c "import sys; sys.exit(3)"')
     result = check_oracle(task, project, workspaces_root=tmp_path / "ws")
     assert result.passed is False
     assert result.code is None
@@ -314,7 +317,7 @@ def test_check_regression_passes_with_gold(tmp_path: Path) -> None:
 def test_check_regression_gold_regression(tmp_path: Path) -> None:
     task = make_task(tmp_path)
     project = make_project(
-        regression_command=f'{sys.executable} -c "import sys; sys.exit(1)"'
+        regression_command=f'"{sys.executable}" -c "import sys; sys.exit(1)"'
     )
     result = check_regression(task, project, workspaces_root=tmp_path / "ws")
     assert result.passed is False
@@ -397,7 +400,7 @@ def test_check_determinism_flaky(tmp_path: Path) -> None:
         "    sys.exit(1)\n"
         f"sys.exit(subprocess.run([{str(sys.executable)!r}, '-m', 'pytest', '-q']).returncode)\n"
     )
-    project = make_project(test_command=f"{sys.executable} {script}")
+    project = make_project(test_command=f'"{sys.executable}" "{script}"')
     result = check_determinism(task, project, workspaces_root=tmp_path / "ws", runs=2)
     assert result.passed is False
     assert result.code == RejectionCode.FLAKY_VERIFIER
@@ -430,7 +433,7 @@ def test_check_determinism_skipped_without_test_command(tmp_path: Path) -> None:
 # Exit 0 only when run from backend/ AND the install command left its marker
 # there — proves install and the check command both ran in project.cwd.
 IN_BACKEND_CMD = (
-    f'{sys.executable} -c "import os, sys; sys.exit(0 if '
+    f'"{sys.executable}" -c "import os, sys; sys.exit(0 if '
     "os.path.basename(os.getcwd()) == 'backend' and "
     'os.path.exists(\'install_marker.txt\') else 1)"'
 )
@@ -474,7 +477,7 @@ def test_check_runs_install_and_command_inside_project_cwd(tmp_path: Path) -> No
     task = make_backend_task(tmp_path)
     project = make_project(
         cwd="backend",
-        install_command=f"{sys.executable} -c \"open('install_marker.txt', 'w').write('x')\"",
+        install_command=f'"{sys.executable}" -c "open(\'install_marker.txt\', \'w\').write(\'x\')"',
         test_command=IN_BACKEND_CMD,
     )
     result = check_oracle(task, project, workspaces_root=tmp_path / "ws")
