@@ -385,3 +385,15 @@ def test_project_paths(tmp_path: Path) -> None:
     paths.ensure()
     assert paths.state_db.parent.is_dir()
     assert paths.workspaces_dir.is_dir()
+
+
+def test_version_single_sourced_from_pyproject() -> None:
+    """The package version must match pyproject.toml exactly — a stale literal
+    here once shipped a 0.8.0 wheel that reported itself as 0.7.0 (v0.8.0
+    release forensics)."""
+    import tomllib
+
+    import repobench
+
+    pyproject = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+    assert repobench.__version__ == pyproject
