@@ -543,7 +543,10 @@ async def test_execute_project_cwd_runs_install_and_verifier_in_subdir(tmp_path:
     executor = _executor(tmp_path, project_cfg=project_cfg)
     result = await executor.execute(task, _command_target("mono-agent", fix_agent))
 
-    assert result.outcome == TrialOutcome.SOLVED, result.error
+    assert result.outcome == TrialOutcome.SOLVED, (
+        f"error={result.error} tests={result.tests_passed}/{result.tests_total} "
+        f"failed={result.tests_failed} patch_tail={(result.agent_patch or '')[-400:]}"
+    )
     assert result.task_verified is True
     assert result.regression_verified is True
 
