@@ -14,15 +14,9 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from repobench.core.types import (
+    SIZE_CLASS_REJECTIONS,
     CandidateInfo,
-    RejectionCode,
     TaskStatus,
-)
-
-# Size-class rejections are the decisions adaptive mining exists to revisit
-# (PRD §10): TASK_TOO_LARGE/TASK_TOO_SMALL say "too big/small", not "invalid".
-_SIZE_REJECTIONS = frozenset(
-    {RejectionCode.TASK_TOO_LARGE, RejectionCode.TASK_TOO_SMALL}
 )
 
 
@@ -62,11 +56,14 @@ def compute_shadow_delta(
     by_number_hard = {c.pr.number: c for c in hard_caps}
 
     additional = sorted(set(adaptive_pool) - set(hard_pool))
+    # Size-class rejections are the decisions adaptive mining exists to revisit
+    # (PRD §10): TASK_TOO_LARGE/TASK_TOO_SMALL say "too big/small", not
+    # "invalid" (SIZE_CLASS_REJECTIONS in repobench.core.types).
     recovered = [
         number
         for number in additional
         if by_number_hard.get(number) is not None
-        and by_number_hard[number].rejection_code in _SIZE_REJECTIONS
+        and by_number_hard[number].rejection_code in SIZE_CLASS_REJECTIONS
     ]
     by_complexity: dict[str, int] = {}
     for number in additional:

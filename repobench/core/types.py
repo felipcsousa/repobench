@@ -91,16 +91,63 @@ class RejectionCode(str, enum.Enum):
     LEAKAGE_HIGH = "LEAKAGE_HIGH"
 
 
+# Rejections that mean "would be eligible except for its size" (PRD §37): the
+# PRs whose fate the old cap decided. They stay inside the cap-pressure
+# population (repobench.mining.benchmarkability) and are exactly the
+# recoveries shadow mode counts (repobench.mining.shadow). Methodological
+# gates (history, instruction, verifier evidence, implementation exists)
+# remove a PR from that population instead. TASK_EXTREME_SCOPE is adaptive-only
+# (the legacy hard_caps path never emits it), so including it changes no
+# hard_caps-driven decision.
+SIZE_CLASS_REJECTIONS: frozenset[RejectionCode] = frozenset(
+    {
+        RejectionCode.TASK_TOO_SMALL,
+        RejectionCode.TASK_TOO_LARGE,
+        RejectionCode.TASK_EXTREME_SCOPE,
+    }
+)
+
+
 class CandidateClass(str, enum.Enum):
     """Human-readable confidence class derived from candidate_score (PRD §24).
 
     HIGH_CONFIDENCE / MEDIUM_CONFIDENCE / EXPERIMENTAL; thresholds live in
     TaskMiningConfig.candidate_score and are subject to field calibration.
+
+    This enum is the one canonical mapping home for every external spelling of
+    the class: `short_label` names the terminal summary-table column and
+    `config_token` names the task_mining.validation.include vocabulary and
+    progress lines. CLI table builders, config parsing and progress renderers
+    all consume these properties instead of keeping private copies.
     """
 
     HIGH_CONFIDENCE = "HIGH_CONFIDENCE"
     MEDIUM_CONFIDENCE = "MEDIUM_CONFIDENCE"
     EXPERIMENTAL = "EXPERIMENTAL"
+
+    @property
+    def short_label(self) -> str:
+        """Compact terminal-table column spelling: HIGH / MED / EXP."""
+        return _CANDIDATE_CLASS_SHORT_LABELS[self]
+
+    @property
+    def config_token(self) -> str:
+        """task_mining.validation.include vocabulary: high / medium / experimental."""
+        return _CANDIDATE_CLASS_CONFIG_TOKENS[self]
+
+
+# The one mapping home for the external spellings above (see CandidateClass).
+_CANDIDATE_CLASS_SHORT_LABELS: dict[CandidateClass, str] = {
+    CandidateClass.HIGH_CONFIDENCE: "HIGH",
+    CandidateClass.MEDIUM_CONFIDENCE: "MED",
+    CandidateClass.EXPERIMENTAL: "EXP",
+}
+
+_CANDIDATE_CLASS_CONFIG_TOKENS: dict[CandidateClass, str] = {
+    CandidateClass.HIGH_CONFIDENCE: "high",
+    CandidateClass.MEDIUM_CONFIDENCE: "medium",
+    CandidateClass.EXPERIMENTAL: "experimental",
+}
 
 
 class TrialOutcome(str, enum.Enum):

@@ -12,6 +12,7 @@ import yaml
 
 from repobench.config import BenchmarkConfig, RepoBenchConfig, TaskMiningConfig
 from repobench.core.types import (
+    SIZE_CLASS_REJECTIONS,
     Assessment,
     CandidateClass,
     CandidateInfo,
@@ -124,9 +125,10 @@ def test_behavioral_loc_floor() -> None:
 # ---------------------------------------------------------------- percentiles
 
 
-def test_percentile_rank_empty_values_is_neutral() -> None:
-    # No repository baseline exists yet: 50.0, not an invented P0/P100.
-    assert percentile_rank(900.0, []) == 50.0
+def test_percentile_rank_empty_values_is_none() -> None:
+    # No repository baseline exists yet: None — "not measured" (the honesty
+    # rule), never an invented neutral P50 / P0 / P100.
+    assert percentile_rank(900.0, []) is None
 
 
 def test_percentile_rank_known_distribution() -> None:
@@ -158,7 +160,8 @@ def test_distribution_stats_nearest_rank() -> None:
     # Nearest-rank: each quantile is a value that actually exists in the list.
     values = [40.0, 10.0, 30.0, 20.0]  # unsorted input, deterministic output
     assert distribution_stats(values) == {"p50": 20.0, "p75": 30.0, "p90": 40.0}
-    assert distribution_stats([]) == {"p50": 0.0, "p75": 0.0, "p90": 0.0}
+    # Empty input: no baseline was measured — None, never a zeroed measurement.
+    assert distribution_stats([]) is None
 
 
 # ---------------------------------------------------------------- config
@@ -291,6 +294,34 @@ def test_new_enum_members() -> None:
     # Legacy hard-cap codes stay available (PRD §38).
     assert RejectionCode.TASK_TOO_LARGE.value == "TASK_TOO_LARGE"
     assert RejectionCode.TASK_TOO_SMALL.value == "TASK_TOO_SMALL"
+
+
+def test_candidate_class_canonical_mappings() -> None:
+    """CandidateClass is the one mapping home for its external spellings:
+    terminal-table short labels and task_mining.validation.include tokens."""
+    assert CandidateClass.HIGH_CONFIDENCE.short_label == "HIGH"
+    assert CandidateClass.MEDIUM_CONFIDENCE.short_label == "MED"
+    assert CandidateClass.EXPERIMENTAL.short_label == "EXP"
+    assert CandidateClass.HIGH_CONFIDENCE.config_token == "high"
+    assert CandidateClass.MEDIUM_CONFIDENCE.config_token == "medium"
+    assert CandidateClass.EXPERIMENTAL.config_token == "experimental"
+
+
+def test_size_class_rejections_canonical_in_types() -> None:
+    """SIZE_CLASS_REJECTIONS lives beside RejectionCode (its concept, PRD §37)
+    and both mining consumers import it — no private copies remain."""
+    assert {
+        RejectionCode.TASK_TOO_SMALL,
+        RejectionCode.TASK_TOO_LARGE,
+        RejectionCode.TASK_EXTREME_SCOPE,
+    } == set(SIZE_CLASS_REJECTIONS)
+    assert RejectionCode.NO_INSTRUCTION not in SIZE_CLASS_REJECTIONS
+
+    import repobench.mining.benchmarkability as benchmarkability
+    import repobench.mining.shadow as shadow
+
+    assert benchmarkability.SIZE_CLASS_REJECTIONS is SIZE_CLASS_REJECTIONS
+    assert shadow.SIZE_CLASS_REJECTIONS is SIZE_CLASS_REJECTIONS
 
 
 # ---------------------------------------------------------------- storage (PRD §68)

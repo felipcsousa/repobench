@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from repobench.config import ProjectConfig
 from repobench.core.types import (
+    SIZE_CLASS_REJECTIONS,
     Assessment,
     CandidateClass,
     CandidateInfo,
@@ -88,18 +89,6 @@ class BenchmarkabilityReport(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
-# Rejections that stand for "would be eligible except for its size" (PRD §37):
-# they stay inside the cap-pressure population because they are exactly the PRs
-# whose fate the old cap decided. Methodological gates (history, instruction,
-# verifier evidence, implementation exists) remove a PR from the population.
-_SIZE_REJECTIONS = frozenset(
-    {
-        RejectionCode.TASK_TOO_SMALL,
-        RejectionCode.TASK_TOO_LARGE,
-        RejectionCode.TASK_EXTREME_SCOPE,
-    }
-)
-
 # Instruction provenance weights (PRD §14): tiers A/B are strong evidence,
 # tier C is possibly solution-contaminated (half weight), tier D is derived
 # from the solution by construction (lighter still).
@@ -155,16 +144,17 @@ def compute_scope_profile(candidates: list[CandidateInfo]) -> ScopeProfile:
     """Repository change profile and cap pressure (PRD §32).
 
     The population is every candidate that cleared the methodological gates —
-    `rejection_code` None or a size-class code (see _SIZE_REJECTIONS). Over it:
-    behavioral-LOC P50/P75/P90 (nearest-rank, repobench.mining.scope) and the
-    share of implementation LOCs above the old 400-LOC default cap. An empty
-    population yields n == 0 and cap_pressure None — no baseline, never a zero
-    that would read as a measurement.
+    `rejection_code` None or a size-class code (see SIZE_CLASS_REJECTIONS in
+    repobench.core.types). Over it: behavioral-LOC P50/P75/P90 (nearest-rank,
+    repobench.mining.scope) and the share of implementation LOCs above the old
+    400-LOC default cap. An empty population yields n == 0, zeroed percentiles
+    and cap_pressure None — no baseline, never a zero that would read as a
+    measurement.
     """
     eligible = [
         c
         for c in candidates
-        if c.rejection_code is None or c.rejection_code in _SIZE_REJECTIONS
+        if c.rejection_code is None or c.rejection_code in SIZE_CLASS_REJECTIONS
     ]
     stats = distribution_stats([float(behavioral_loc_of(c.assessment)) for c in eligible])
     cap_pressure = None
@@ -176,9 +166,9 @@ def compute_scope_profile(candidates: list[CandidateInfo]) -> ScopeProfile:
         )
         cap_pressure = round(100.0 * above / len(eligible), 1)
     return ScopeProfile(
-        p50=stats["p50"],
-        p75=stats["p75"],
-        p90=stats["p90"],
+        p50=stats["p50"] if stats is not None else 0.0,
+        p75=stats["p75"] if stats is not None else 0.0,
+        p90=stats["p90"] if stats is not None else 0.0,
         n=len(eligible),
         cap_pressure=cap_pressure,
     )

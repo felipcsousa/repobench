@@ -177,17 +177,24 @@ def behavioral_loc(features: ScopeFeatures) -> int:
     return (features.implementation_loc - features.generated_loc) + features.generated_loc // 5
 
 
-def percentile_rank(value: float, values: list[float]) -> float:
-    """Percentile of `value` within `values`, 0-100: 100 * |{v <= value}| / n.
-
-    Empty `values` returns 50.0 — the neutral middle — because with no
-    repository baseline yet there is no evidence to rank against; claiming P0
-    or P100 from no data would be an invented number.
-    """
-    if not values:
-        return 50.0
+def _rank_nonempty(value: float, values: list[float]) -> float:
+    """Rank of `value` within a non-empty `values`: 100 * |{v <= value}| / n."""
     below_or_equal = sum(1 for v in values if v <= value)
     return 100.0 * below_or_equal / len(values)
+
+
+def percentile_rank(value: float, values: list[float]) -> float | None:
+    """Percentile of `value` within `values`, 0-100: 100 * |{v <= value}| / n.
+
+    Empty `values` returns None: with no repository baseline there is nothing
+    to rank against, and the honesty rule (PRD §53-54) keeps "not measured"
+    distinguishable from a measurement — never an invented neutral P50, P0 or
+    P100. Callers decide what no baseline means (e.g. assess_scope scores the
+    scope component neutral on None).
+    """
+    if not values:
+        return None
+    return _rank_nonempty(value, values)
 
 
 def complexity_from_percentile(percentile: float) -> Complexity:
@@ -203,21 +210,21 @@ def complexity_from_percentile(percentile: float) -> Complexity:
     return Complexity.SMALL
 
 
-def distribution_stats(values: list[float]) -> dict[str, float]:
+def distribution_stats(values: list[float]) -> dict[str, float] | None:
     """P50 / P75 / P90 of `values` for the cap-pressure report (PRD §32).
 
     Nearest-rank on the sorted list via the same convention as
     `percentile_rank`: each quantile is the smallest observed value whose rank
     reaches it — a value that actually exists in the repository, never an
-    interpolation between two samples. Empty input yields 0.0 for every stat;
-    callers must treat that as "no baseline measured", not as a measurement.
+    interpolation between two samples. Empty input returns None: no baseline
+    was measured, and None stays distinguishable from a zeroed measurement.
     """
     if not values:
-        return {"p50": 0.0, "p75": 0.0, "p90": 0.0}
+        return None
     ordered = sorted(values)
     stats: dict[str, float] = {}
     for name, quantile in (("p50", 50.0), ("p75", 75.0), ("p90", 90.0)):
         stats[name] = next(
-            v for v in ordered if percentile_rank(v, values) >= quantile
+            v for v in ordered if _rank_nonempty(v, values) >= quantile
         )
     return stats

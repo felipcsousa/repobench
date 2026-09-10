@@ -188,12 +188,16 @@ def _adaptive_candidate(
 
     # Scored candidate (PRD §11-24). The percentile is rounded once and reused
     # for complexity, scope confidence and risk flags, so every stored field
-    # recomputes exactly from the stored percentile.
+    # recomputes exactly from the stored percentile. None (no repository
+    # baseline: nothing to rank against) keeps the absolute complexity and lets
+    # assess_scope / risk_flags treat it as not measured — never an invented
+    # neutral P50.
     behavioral = behavioral_loc(features)
-    percentile = round(percentile_rank(behavioral, baseline), 1)
+    ranked = percentile_rank(behavioral, baseline)
+    percentile = round(ranked, 1) if ranked is not None else None
     complexity = (
         compute_complexity_percentile(percentile)
-        if cfg.complexity.method == "repository_percentile"
+        if cfg.complexity.method == "repository_percentile" and percentile is not None
         else absolute_complexity
     )
     components: dict[str, ComponentScore] = {

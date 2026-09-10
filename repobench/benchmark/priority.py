@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from repobench.benchmark.sampling import (
     DIMENSION_NAMES,
+    dimension_values,
     distribution_of,
     tv_distance,
 )
@@ -43,27 +44,16 @@ _CLASS_RANKS: dict[CandidateClass, int] = {
 UNSCORED_CLASS_RANK = 1
 
 
-def _dimension_keys(assessment: Assessment) -> tuple[str, str, str]:
-    """The candidate's key in each benchmark dimension, in DIMENSION_NAMES order
-    (PRD §66: task_type, subsystem, complexity) — the same values sampling and
-    coverage score."""
-    return (
-        assessment.task_type.value,
-        assessment.subsystem,
-        assessment.complexity.value,
-    )
-
-
 def _universe_distributions(universe: list[CandidateInfo]) -> list[dict[str, float]]:
     return [
-        distribution_of([_dimension_keys(c.assessment)[i] for c in universe])
+        distribution_of([dimension_values(c.assessment)[i] for c in universe])
         for i in range(len(DIMENSION_NAMES))
     ]
 
 
 def _valid_distributions(valid: list[Assessment]) -> list[dict[str, float]]:
     return [
-        distribution_of([_dimension_keys(a)[i] for a in valid])
+        distribution_of([dimension_values(a)[i] for a in valid])
         for i in range(len(DIMENSION_NAMES))
     ]
 
@@ -94,7 +84,7 @@ def coverage_need(
     dim_weights = (weights.task_type, weights.subsystem, weights.complexity)
     universe_dists = _universe_distributions(universe)
     valid_dists = _valid_distributions(validated_assessments)
-    keys = _dimension_keys(candidate_assessment)
+    keys = dimension_values(candidate_assessment)
     need = 0.0
     for i, weight in enumerate(dim_weights):
         deficit = max(
