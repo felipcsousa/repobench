@@ -337,6 +337,8 @@ def analyze(ctx: typer.Context) -> None:
     )
     if pool_size == 0:
         render.render_zero_candidate_experience(outcome, cfg.repository.lookback_days)
+    if getattr(outcome, "shadow_delta", None) is not None:
+        render.render_shadow_delta(outcome)
     render.render_merge_style_warnings(outcome)
     if outcome.public_repository:
         render.render_public_repository_warning()

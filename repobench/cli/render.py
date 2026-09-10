@@ -237,6 +237,35 @@ def render_zero_candidate_experience(
         echo("2. Try a repository with richer engineering history")
 
 
+def render_shadow_delta(outcome) -> None:  # noqa: ANN001 - AnalyzeOutcome
+    """Shadow mode report (PRD §77 Phase B): hard_caps still controls; the delta
+    is what adaptive WOULD decide — the calibration data for flipping the
+    default later. Every count comes from the two real mining passes."""
+    delta = outcome.shadow_delta
+    echo("")
+    echo("Shadow mode — adaptive mining evaluated alongside hard_caps")
+    echo("")
+    kv("Controlling policy", delta.controlling_policy)
+    kv("Pool under hard_caps", f"{delta.hard_caps_pool}")
+    kv("Pool under adaptive", f"{delta.adaptive_pool}")
+    kv(
+        "Additional candidates",
+        f"+{delta.additional_candidates} "
+        f"({delta.recovered_from_size_caps} recovered from size caps)",
+    )
+    if delta.by_complexity:
+        sizes = " · ".join(f"{key}×{count}" for key, count in delta.by_complexity.items())
+        kv("Additional by size", sizes)
+    if delta.adaptive_class_counts:
+        classes = " · ".join(
+            f"{key}×{count}" for key, count in delta.adaptive_class_counts.items()
+        )
+        kv("Adaptive classes", classes)
+    echo("")
+    echo("Shadow candidates never reach storage or benchmarks — hard_caps decides.")
+    echo("")
+
+
 def render_merge_style_warnings(outcome) -> None:  # noqa: ANN001 - AnalyzeOutcome
     """Issue #31 field-credibility notes: squash-merged PRs are mined from
     commit subjects, and — only when gh ground truth exists — recall low enough

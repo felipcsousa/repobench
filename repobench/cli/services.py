@@ -49,6 +49,7 @@ from repobench.mining.benchmarkability import (
     compute_scope_profile,
 )
 from repobench.mining.candidates import mine_candidates
+from repobench.mining.shadow import ShadowDelta, compute_shadow_delta
 from repobench.mining.subsystem import detect_package_dirs, load_codeowners
 from repobench.repository.git import GitRepo, MergeStyleCounts
 from repobench.repository.github import GitHubClient
@@ -166,6 +167,9 @@ class AnalyzeOutcome:
     funnel: CandidateFunnel | None = None
     benchmarkability: BenchmarkabilityReport | None = None
     scope_profile: ScopeProfile | None = None
+    # Shadow mode only (PRD §77 Phase B): the adaptive-vs-hard_caps decision
+    # disagreement; None in every other policy.
+    shadow_delta: ShadowDelta | None = None
 
 
 def _local_enricher(repo: GitRepo) -> Callable[[PRInfo], PRInfo]:
@@ -211,15 +215,27 @@ def analyze_repository(root: Path, cfg: RepoBenchConfig) -> AnalyzeOutcome:
     lookback = cfg.repository.lookback_days
     merged = repo.merged_prs(lookback, now=now)
     merge_styles = repo.merge_style_counts(lookback, now=now)
-    candidates = mine_candidates(
-        repo,
-        cfg.task_mining,
+    mining_args = dict(
         enrich=enrich,
         lookback_days=lookback,
         codeowners=load_codeowners(root),
         package_dirs=detect_package_dirs(root),
         project_cfg=cfg.project,
     )
+    # Shadow mode (PRD §77 Phase B): both decisions run on the same window —
+    # hard_caps keeps controlling what is persisted and reported, adaptive is
+    # reduced to a ShadowDelta for calibration. No shadow candidate persists.
+    shadow_delta = None
+    effective_mining_cfg = cfg.task_mining
+    if cfg.task_mining.size_policy == "shadow":
+        hard_cfg = cfg.task_mining.model_copy(update={"size_policy": "hard_caps"})
+        adaptive_cfg = cfg.task_mining.model_copy(update={"size_policy": "adaptive"})
+        shadow_candidates = mine_candidates(repo, adaptive_cfg, **mining_args)
+        shadow_delta = compute_shadow_delta(
+            mine_candidates(repo, hard_cfg, **mining_args), shadow_candidates
+        )
+        effective_mining_cfg = hard_cfg
+    candidates = mine_candidates(repo, effective_mining_cfg, **mining_args)
     pool = [c for c in candidates if c.status is not TaskStatus.FILTERED]
     summary = summarize_analysis(
         len(merged), candidates, suggest_benchmark_size(len(pool))
@@ -252,6 +268,7 @@ def analyze_repository(root: Path, cfg: RepoBenchConfig) -> AnalyzeOutcome:
         funnel=funnel,
         benchmarkability=benchmarkability,
         scope_profile=scope_profile,
+        shadow_delta=shadow_delta,
     )
     _write_analyze_telemetry(root, outcome)
     return outcome
@@ -303,6 +320,7 @@ def _write_analyze_telemetry(root: Path, outcome: AnalyzeOutcome) -> None:
         "scope_profile": (
             outcome.scope_profile.model_dump() if outcome.scope_profile else None
         ),
+        "shadow": outcome.shadow_delta.model_dump() if outcome.shadow_delta else None,
         "assessment_version": assessment_version,
         "repobench_version": __version__,
         "timestamp": utcnow().isoformat(),
