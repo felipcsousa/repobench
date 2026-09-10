@@ -21,6 +21,13 @@ from repobench.benchmark.manifest import (
     load_stored_manifest,
     save_manifest,
 )
+from repobench.benchmark.priority import (
+    class_rank,
+    coverage_need,
+    representativeness,
+    top_deficit,
+    validation_priority,
+)
 from repobench.benchmark.reuse import (
     reusable_task_ids,
     reused_validation_report,
@@ -41,6 +48,7 @@ from repobench.cli.services import (
 from repobench.config import RepoBenchConfig
 from repobench.core.errors import ReconstructionError, UsageError
 from repobench.core.types import (
+    CandidateClass,
     CandidateInfo,
     ExecutionTarget,
     RejectionCode,
@@ -115,6 +123,14 @@ class BenchmarkBuildOutcome:
     # Issue #33: candidates whose history could not be reconstructed at all —
     # persisted REJECTED, but never in results (a TaskBuildResult needs a package).
     reconstruction_rejected: list[CandidateInfo] = field(default_factory=list)
+    # Adaptive build (PRD §64): true when the loop ended with fewer VALID tasks
+    # than requested (the benchmark is still built — honest, smaller), and the
+    # human-readable warnings that explain it. Empty list = no insufficiency.
+    insufficient: bool = False
+    build_warnings: list[str] = field(default_factory=list)
+    # PRD §63: how many candidates the validation budget allowed before the
+    # loop stopped; None = the loop was never budget-limited.
+    budget_stopped_at: int | None = None
 
 
 def _package_for(repo: GitRepo, candidate: CandidateInfo, paths: ProjectPaths) -> TaskPackage:
@@ -259,7 +275,16 @@ def build_benchmark(
 
     With stop_when_sufficient the loop breaks as soon as enough VALID tasks
     cover the requested size — cheaper, but the sampling pool is smaller, so
-    distribution matching weakens (opt-in; the default validates everything)."""
+    distribution matching weakens (opt-in; the default validates everything).
+
+    Adaptive builds (task_mining.size_policy: adaptive, PRD §25-29, §61-66) turn
+    that opt-in into the strategy: the pool is class-filtered
+    (task_mining.validation.include, default high+medium), candidates are
+    validated in coverage-aware priority order (HIGH → MEDIUM → EXPERIMENTAL,
+    then 0.65×score + 0.35×coverage need, re-picked after every validation),
+    the loop stops at requested size + min_representativeness, and
+    benchmark.validation_budget.max_candidates bounds the work. hard_caps keeps
+    today's semantics unchanged."""
     paths = project_paths(root)
     repo = GitRepo(root)
     candidates = storage.list_candidates()
@@ -280,6 +305,39 @@ def build_benchmark(
             raise UsageError(
                 "no task candidates match benchmark.allowed_confidences "
                 f"{allowed_confidences} — nothing to benchmark"
+            )
+
+    # Adaptive class filter (PRD §33): the validation pool starts at HIGH +
+    # MEDIUM confidence unless task_mining.validation.include says otherwise —
+    # experimental candidates stay eligible, just out of the default pool.
+    adaptive = cfg.task_mining.size_policy == "adaptive"
+    if adaptive:
+        include = cfg.task_mining.validation.include or ["high", "medium"]
+        tokens = {"high", "medium", "experimental"}
+        unknown = [name for name in include if name not in tokens]
+        if unknown:
+            raise UsageError(
+                "task_mining.validation.include has unknown class(es) "
+                f"{unknown} — valid: {sorted(tokens)}"
+            )
+        allowed_classes = {
+            {"high": CandidateClass.HIGH_CONFIDENCE, "medium": CandidateClass.MEDIUM_CONFIDENCE,
+             "experimental": CandidateClass.EXPERIMENTAL}[name]
+            for name in include
+        }
+        pool = [c for c in pool if c.assessment.candidate_class in allowed_classes]
+        if not pool:
+            present = sorted(
+                {
+                    c.assessment.candidate_class.value
+                    for c in candidates
+                    if c.assessment.candidate_class is not None
+                }
+            )
+            raise UsageError(
+                f"no candidates in class(es) {include} — classes present in this "
+                f"repository: {present or 'none'} (re-run `repobench analyze` "
+                "with size_policy: adaptive to score candidates)"
             )
 
     # Tier-D generation (opt-in): spends real tokens, so it only ever runs here
@@ -315,9 +373,51 @@ def build_benchmark(
         log(warning)
     results: list[TaskBuildResult] = []
     reconstruction_rejected: list[CandidateInfo] = []
-    for i, candidate in enumerate(pool, start=1):
+    # Adaptive queue state (PRD §25-29, §63): the next candidate is re-picked
+    # after every validation so coverage need can steer the order dynamically;
+    # hard_caps keeps today's fixed pr_number order. The budget counts every
+    # candidate that paid validation work (fresh or reused).
+    dim_weights = cfg.benchmark.dimensions
+    remaining = list(pool)
+    valid_assessments: list = []
+    last_deficit: tuple[str, str] | None = None
+    budget = cfg.benchmark.validation_budget.max_candidates
+    validated_count = 0
+    budget_stopped_at: int | None = None
+    position = 0
+    while remaining:
+        if adaptive:
+            candidate = min(
+                remaining,
+                key=lambda c: (
+                    class_rank(c),
+                    -validation_priority(
+                        c.assessment.candidate_score,
+                        coverage_need(c.assessment, valid_assessments, candidates, dim_weights),
+                    ),
+                    c.candidate_id,
+                ),
+            )
+        else:
+            candidate = remaining[0]
+        remaining.remove(candidate)
+        position += 1
         if log is not None:
-            log(f"[{i}/{len(pool)}] PR #{candidate.pr.number}: validating…")
+            if adaptive and candidate.assessment.candidate_score is not None:
+                # PRD §60: score and class ride the progress line so the
+                # adaptive ordering is visible while it happens.
+                class_short = {
+                    CandidateClass.HIGH_CONFIDENCE: "HIGH",
+                    CandidateClass.MEDIUM_CONFIDENCE: "MED",
+                    CandidateClass.EXPERIMENTAL: "EXP",
+                }[candidate.assessment.candidate_class or CandidateClass.MEDIUM_CONFIDENCE]
+                log(
+                    f"[{position}/{len(pool)}] PR #{candidate.pr.number} · "
+                    f"score {candidate.assessment.candidate_score:.2f} · {class_short} · "
+                    f"{candidate.assessment.task_type.value}: validating…"
+                )
+            else:
+                log(f"[{position}/{len(pool)}] PR #{candidate.pr.number}: validating…")
         try:
             package = _package_for(repo, candidate, paths)
         except ReconstructionError as exc:
@@ -369,6 +469,7 @@ def build_benchmark(
             reused_count += 1
         else:
             report = validator.validate(package, leakages=leakage)
+        validated_count += 1
         result = TaskBuildResult(
             candidate=candidate, package=package, leakage=leakage, report=report
         )
@@ -384,16 +485,53 @@ def build_benchmark(
             else:
                 code = f" ({result.rejection_code.value})" if result.rejection_code else ""
                 log(f"PR #{pr}: {result.status.value}{code}")
-        if stop_when_sufficient:
-            valid_count = sum(1 for r in results if r.status is TaskStatus.VALID)
-            if valid_count >= requested:
+        if result.status is TaskStatus.VALID:
+            valid_assessments.append(result.candidate.assessment)
+            if adaptive and log is not None:
+                # PRD §28/§60: announce the queue steering only when the top
+                # coverage gap actually moves — never per pick.
+                deficit = top_deficit(valid_assessments, candidates, dim_weights)
+                if deficit is not None and deficit != last_deficit and remaining:
+                    dimension, key = deficit
+                    log(f"coverage need: {key} ({dimension}) — prioritizing {key} candidates")
+                last_deficit = deficit
+        valid_count = sum(1 for r in results if r.status is TaskStatus.VALID)
+        if adaptive:
+            # PRD §26/§61: adaptive builds stop once the requested size is
+            # covered AND the representativeness threshold (when configured)
+            # is met — never validate 180 candidates after 24 already suffice.
+            sufficient = valid_count >= requested
+            if sufficient and cfg.benchmark.min_representativeness is not None:
+                sufficient = (
+                    representativeness(valid_assessments, candidates, dim_weights)
+                    >= cfg.benchmark.min_representativeness
+                )
+            if sufficient:
                 if log is not None:
                     log(
                         f"stopping early: {valid_count} valid task(s) cover size "
-                        f"{requested} — {len(pool) - i} candidate(s) left "
+                        f"{requested} — {len(remaining)} candidate(s) left "
                         "unvalidated; smaller sampling pool"
                     )
                 break
+        elif stop_when_sufficient and valid_count >= requested:
+            if log is not None:
+                log(
+                    f"stopping early: {valid_count} valid task(s) cover size "
+                    f"{requested} — {len(remaining)} candidate(s) left "
+                    "unvalidated; smaller sampling pool"
+                )
+            break
+        if budget is not None and validated_count >= budget and remaining:
+            # PRD §63: bounded work — the budget, not the pool, ended the loop.
+            budget_stopped_at = validated_count
+            if log is not None:
+                log(
+                    f"validation budget reached: {validated_count} candidates "
+                    f"validated ({valid_count} valid so far), {len(remaining)} "
+                    "left unvalidated"
+                )
+            break
 
     valid = [r for r in results if r.status is TaskStatus.VALID]
     if not valid:
@@ -413,6 +551,42 @@ def build_benchmark(
             "Check project.test_command in repobench.yml and `repobench candidates`; "
             "`repobench candidates --show <PR>` prints each task's validation "
             "checks with output tails (issue #35)."
+        )
+
+    # Graceful insufficiency (PRD §64-66): below benchmark.min_size there is no
+    # honest benchmark to build (INSUFFICIENT_BENCHMARK, no strong claims);
+    # between min_size and the requested size the build proceeds — smaller and
+    # honestly warned, which beats no benchmark at all. Adaptive only: legacy
+    # hard_caps builds keep their historical "build with what validated" behavior.
+    build_warnings: list[str] = []
+    if adaptive and len(valid) < cfg.benchmark.min_size:
+        codes = sorted(
+            {
+                *(r.rejection_code.value for r in results if r.rejection_code),
+                *(
+                    c.rejection_code.value
+                    for c in reconstruction_rejected
+                    if c.rejection_code
+                ),
+            }
+        )
+        raise UsageError(
+            f"INSUFFICIENT_BENCHMARK — only {len(valid)} VALID task(s), below the "
+            f"minimum of {cfg.benchmark.min_size} (benchmark.min_size). "
+            f"Rejection codes: {', '.join(codes) or 'unknown'}. "
+            "Widen repository.lookback_days, relax task_mining.validation.include, "
+            "or raise benchmark.validation_budget.max_candidates."
+        )
+    if len(valid) < requested:
+        if log is not None:
+            log(
+                f"requested {requested}, available {len(valid)} — building with "
+                f"{len(valid)} tasks"
+            )
+        build_warnings.append("Low sample size.")
+    if budget_stopped_at is not None and len(valid) < requested:
+        build_warnings.append(
+            f"Validation budget stopped at {budget_stopped_at} candidates."
         )
 
     metadatas = [r.package.metadata for r in valid]
@@ -515,6 +689,9 @@ def build_benchmark(
         reuse_valid=reuse_valid,
         reused=reused_count,
         reconstruction_rejected=reconstruction_rejected,
+        insufficient=len(valid) < requested,
+        build_warnings=build_warnings,
+        budget_stopped_at=budget_stopped_at,
     )
 
 
