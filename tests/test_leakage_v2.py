@@ -55,7 +55,6 @@ def test_generic_pr_reference_is_medium_with_evidence(tmp_path: Path) -> None:
     assert len(report.evidence) == 1
     assert "README.md" in report.evidence[0]
     assert "'#9'" in report.evidence[0]
-    assert report.findings == report.evidence  # backward-compat alias
 
 
 def test_pull_reference_forms_are_medium(tmp_path: Path) -> None:

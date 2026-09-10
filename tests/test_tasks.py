@@ -311,7 +311,6 @@ def test_scan_base_archive_clean_scores_78(tmp_path: Path) -> None:
     }
     assert report.checks["network_isolation"] is False
     assert all(report.checks[key] for key in report.checks if key != "network_isolation")
-    assert report.findings == []
     assert report.evidence == []
     assert report.risk == "LOW"
     assert report.score == 78  # 100 - 22: no network sandbox in host-native V1
@@ -325,7 +324,6 @@ def test_scan_base_archive_detects_pr_reference(tmp_path: Path) -> None:
     report = scan_base_archive(package.metadata, package.base_tar)
     assert report.risk == "MEDIUM"
     assert report.evidence and "README.md" in report.evidence[0]
-    assert report.findings == report.evidence  # backward-compat alias
     assert report.score == 78 - 10  # informational MEDIUM penalty
 
 
@@ -357,4 +355,4 @@ def test_leakage_report_model_shape() -> None:
         risk="LOW",
     )
     assert report.score == 78
-    assert report.findings == []  # alias of evidence
+    assert report.evidence == []

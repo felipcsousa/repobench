@@ -222,20 +222,27 @@ def analyze_repository(root: Path, cfg: RepoBenchConfig) -> AnalyzeOutcome:
         package_dirs=detect_package_dirs(root),
         project_cfg=cfg.project,
     )
-    # Shadow mode (PRD §77 Phase B): both decisions run on the same window —
-    # hard_caps keeps controlling what is persisted and reported, adaptive is
-    # reduced to a ShadowDelta for calibration. No shadow candidate persists.
+    # Shadow mode (PRD §77 Phase B): exactly two mining passes run on the same
+    # window — hard_caps and adaptive. hard_caps keeps controlling what is
+    # persisted and reported; adaptive is reduced to a ShadowDelta for
+    # calibration. No shadow candidate persists.
     shadow_delta = None
-    effective_mining_cfg = cfg.task_mining
     if cfg.task_mining.size_policy == "shadow":
-        hard_cfg = cfg.task_mining.model_copy(update={"size_policy": "hard_caps"})
-        adaptive_cfg = cfg.task_mining.model_copy(update={"size_policy": "adaptive"})
-        shadow_candidates = mine_candidates(repo, adaptive_cfg, **mining_args)
-        shadow_delta = compute_shadow_delta(
-            mine_candidates(repo, hard_cfg, **mining_args), shadow_candidates
+        hard = mine_candidates(
+            repo,
+            cfg.task_mining.model_copy(update={"size_policy": "hard_caps"}),
+            **mining_args,
         )
-        effective_mining_cfg = hard_cfg
-    candidates = mine_candidates(repo, effective_mining_cfg, **mining_args)
+        adaptive = mine_candidates(
+            repo,
+            cfg.task_mining.model_copy(update={"size_policy": "adaptive"}),
+            **mining_args,
+        )
+        shadow_delta = compute_shadow_delta(hard, adaptive)
+        # hard_caps keeps controlling what is persisted (PRD §77 Phase B).
+        candidates = hard
+    else:
+        candidates = mine_candidates(repo, cfg.task_mining, **mining_args)
     pool = [c for c in candidates if c.status is not TaskStatus.FILTERED]
     summary = summarize_analysis(
         len(merged), candidates, suggest_benchmark_size(len(pool))

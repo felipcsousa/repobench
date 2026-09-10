@@ -86,7 +86,7 @@ class LeakageReport(pydantic.BaseModel):
     why for every classification (PRD §46). `checks` and `score` are kept for
     backward compatibility with persisted data: score is informational
     (100 − network penalty − per-evidence penalties, clamped 0-100) and never
-    decides the gate. `findings` is a backward-compat alias of `evidence`.
+    decides the gate.
     """
 
     checks: dict[str, bool]  # keys: history_isolation, gold_isolation, verifier_isolation,
@@ -94,11 +94,6 @@ class LeakageReport(pydantic.BaseModel):
     score: int  # 0-100, informational — the GATE is `risk`, not the score
     evidence: list[str]
     risk: Literal["LOW", "MEDIUM", "HIGH"]
-
-    @property
-    def findings(self) -> list[str]:
-        """Backward-compat alias of `evidence` (renamed by PRD §44-46)."""
-        return self.evidence
 
 
 def _gold_identifiers(gold_patch: Path) -> set[str]:
