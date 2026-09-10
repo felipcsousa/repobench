@@ -40,6 +40,14 @@ from repobench.core.types import (
 from repobench.execution.adapters.registry import get_adapter
 from repobench.execution.runner import TrialExecutor, run_matrix
 from repobench.execution.workspace import WorkspaceManager
+from repobench.mining.benchmarkability import (
+    BenchmarkabilityReport,
+    CandidateFunnel,
+    ScopeProfile,
+    compute_benchmarkability,
+    compute_candidate_funnel,
+    compute_scope_profile,
+)
 from repobench.mining.candidates import mine_candidates
 from repobench.mining.subsystem import detect_package_dirs, load_codeowners
 from repobench.repository.git import GitRepo, MergeStyleCounts
@@ -152,6 +160,12 @@ class AnalyzeOutcome:
     # no slug) — the renderers show no recall rather than inventing one.
     merge_styles: MergeStyleCounts = field(default_factory=MergeStyleCounts)
     recall_total: int | None = None
+    # Adaptive UX aggregations (PRD §30-32, §42, §59): None when a caller
+    # constructs the outcome without them — the v2 renderer degrades to the
+    # legacy summary instead of printing partially-invented sections.
+    funnel: CandidateFunnel | None = None
+    benchmarkability: BenchmarkabilityReport | None = None
+    scope_profile: ScopeProfile | None = None
 
 
 def _local_enricher(repo: GitRepo) -> Callable[[PRInfo], PRInfo]:
@@ -210,13 +224,23 @@ def analyze_repository(root: Path, cfg: RepoBenchConfig) -> AnalyzeOutcome:
     summary = summarize_analysis(
         len(merged), candidates, suggest_benchmark_size(len(pool))
     )
+    # Adaptive UX aggregations (PRD §30-32, §42, §59) — computed from the same
+    # candidate list in every size policy; the class counts stay 0 under legacy
+    # hard_caps mining, which never assigns classes (PRD §34).
+    funnel = compute_candidate_funnel(candidates, merged_prs=len(merged))
+    benchmarkability = compute_benchmarkability(candidates, cfg.project)
+    scope_profile = compute_scope_profile(candidates)
+    if any(c.assessment.candidate_class is not None for c in candidates):
+        summary.high_confidence = funnel.high_confidence
+        summary.medium_confidence = funnel.medium_confidence
+        summary.experimental = funnel.experimental
     # gh ground truth only exists when enrichment does; `since` mirrors the git
     # layer's window (_window_since): same clock, microseconds dropped.
     recall_total = None
     if enrichment == "github" and slug is not None:
         since = (now - timedelta(days=lookback)).replace(microsecond=0)
         recall_total = GitHubClient(slug).merged_pr_count(since)
-    return AnalyzeOutcome(
+    outcome = AnalyzeOutcome(
         summary=summary,
         candidates=candidates,
         merged_prs=len(merged),
@@ -225,7 +249,72 @@ def analyze_repository(root: Path, cfg: RepoBenchConfig) -> AnalyzeOutcome:
         public_repository=(repository_visibility(slug) == "PUBLIC") if slug else None,
         merge_styles=merge_styles,
         recall_total=recall_total,
+        funnel=funnel,
+        benchmarkability=benchmarkability,
+        scope_profile=scope_profile,
     )
+    _write_analyze_telemetry(root, outcome)
+    return outcome
+
+
+def _write_analyze_telemetry(root: Path, outcome: AnalyzeOutcome) -> None:
+    """Persist `.repobench/telemetry/analyze.json` (PRD §58).
+
+    Local-first (PRD §58): the repository name and URL never leave the machine
+    and never enter this file — the artifact carries ONLY funnel counts,
+    candidate-class counts, rejection-code counts, the benchmarkability
+    score/band/components, the scope profile, the assessment version, the
+    repobench version and a timestamp. Write failures are logged, never fatal:
+    telemetry must not break an analyze that already succeeded.
+    """
+    from repobench import __version__
+
+    if outcome.funnel is None or outcome.benchmarkability is None:
+        return  # nothing honest to aggregate (outcome built without v2 fields)
+    rejections: dict[str, int] = {}
+    for candidate in outcome.candidates:
+        if candidate.rejection_code is None:
+            continue
+        key = candidate.rejection_code.value
+        rejections[key] = rejections.get(key, 0) + 1
+    # First version string actually stamped on a stored assessment (PRD §69);
+    # legacy hard_caps runs leave None — no version is invented.
+    assessment_version = next(
+        (
+            c.assessment.assessment_version
+            for c in outcome.candidates
+            if c.assessment.assessment_version
+        ),
+        None,
+    )
+    payload = {
+        "funnel": outcome.funnel.model_dump(),
+        "candidate_classes": {
+            "high": outcome.funnel.high_confidence,
+            "medium": outcome.funnel.medium_confidence,
+            "experimental": outcome.funnel.experimental,
+        },
+        "rejections": dict(sorted(rejections.items())),
+        "benchmarkability": {
+            "score": outcome.benchmarkability.score,
+            "band": outcome.benchmarkability.band,
+            "components": outcome.benchmarkability.components,
+        },
+        "scope_profile": (
+            outcome.scope_profile.model_dump() if outcome.scope_profile else None
+        ),
+        "assessment_version": assessment_version,
+        "repobench_version": __version__,
+        "timestamp": utcnow().isoformat(),
+    }
+    path = ProjectPaths(root).repobench_dir / "telemetry" / "analyze.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2))
+    except OSError as exc:
+        logging.getLogger("repobench.cli").warning(
+            "analyze telemetry write failed: %s", exc
+        )
 
 
 def persist_candidates(storage: Storage, candidates: list[CandidateInfo]) -> None:

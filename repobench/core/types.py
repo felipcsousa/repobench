@@ -333,6 +333,12 @@ class AnalyzeSummary(BaseModel):
     validated_candidates: int = 0
     workload: WorkloadDistribution = WorkloadDistribution()
     suggested_benchmark_size: int = 0
+    # Adaptive candidate-class counts (PRD §24, §30): the analyze service fills
+    # them only when adaptive mining scored the candidates; legacy hard_caps
+    # runs keep the zeros — no class was ever computed, and none is invented.
+    high_confidence: int = 0
+    medium_confidence: int = 0
+    experimental: int = 0
 
 
 class TrialResult(BaseModel):

@@ -14,7 +14,15 @@ from rich.console import Console
 from rich.table import Table as RichTable
 
 from repobench.config import RepoBenchConfig, detect_subprojects
-from repobench.core.types import AnalyzeSummary, CandidateInfo, ExecutionTarget
+from repobench.core.types import (
+    AnalyzeSummary,
+    CandidateClass,
+    CandidateInfo,
+    Complexity,
+    ExecutionTarget,
+    RejectionCode,
+    TaskStatus,
+)
 from repobench.execution.pricing_catalog import lookup as catalog_lookup
 
 # Never truncate data on a pipe: terminals get their real width, captured output
@@ -110,6 +118,125 @@ def render_analyze_summary(
     echo("No inference tokens were consumed.")
 
 
+_CLASS_SHORT = {
+    CandidateClass.HIGH_CONFIDENCE: "HIGH",
+    CandidateClass.MEDIUM_CONFIDENCE: "MED",
+    CandidateClass.EXPERIMENTAL: "EXP",
+}
+
+
+def render_analyze_summary_v2(
+    outcome, suggested_size: int, lookback_note: str
+) -> None:  # noqa: ANN001 - AnalyzeOutcome (avoids import cycle)
+    """The PRD §30/§59 analyze summary: candidate funnel, class counts, scope
+    profile with cap pressure, benchmarkability and an honestly-labeled VALID
+    estimate. Sections whose data is absent (None models, zero classes under
+    legacy hard_caps mining) are skipped — never rendered as invented zeros."""
+    funnel = getattr(outcome, "funnel", None)
+    benchmarkability = getattr(outcome, "benchmarkability", None)
+    scope_profile = getattr(outcome, "scope_profile", None)
+    echo("Repository Analysis")
+    echo("────────────────────────────────────")
+    echo("")
+    kv("Merged PRs", f"{outcome.merged_prs}")
+    if funnel is not None:
+        kv("Relevant human changes", f"{funnel.human_changes}")
+        kv("With implementation changes", f"{funnel.with_implementation}")
+        kv("With verifier evidence", f"{funnel.with_verifier_evidence}")
+        kv("With usable instructions", f"{funnel.with_instruction}")
+    echo("")
+    scored = (
+        funnel is not None
+        and funnel.high_confidence + funnel.medium_confidence + funnel.experimental > 0
+    )
+    if scored:
+        echo("Candidate opportunity")
+        echo("")
+        kv("High confidence", f"{funnel.high_confidence}")
+        kv("Medium confidence", f"{funnel.medium_confidence}")
+        kv("Experimental", f"{funnel.experimental}")
+        echo("")
+    if scope_profile is not None and scope_profile.n > 0:
+        if scope_profile.cap_pressure is not None and scope_profile.cap_pressure >= 50:
+            echo("Large changes are common here.")
+        kv("Median implementation LOC", f"{scope_profile.p50:,.0f}")
+        kv("P75", f"{scope_profile.p75:,.0f}")
+        kv("P90", f"{scope_profile.p90:,.0f}")
+        echo("")
+    if benchmarkability is not None:
+        echo("Benchmarkability")
+        echo("")
+        kv("Band", f"{benchmarkability.band} · {benchmarkability.score}/100")
+        components = benchmarkability.components
+        kv(
+            "Components",
+            " · ".join(f"{key.replace('_', ' ')} {value}" for key, value in components.items()),
+        )
+        for note in benchmarkability.notes:
+            echo(f"  {note}")
+        echo("")
+    if scored:
+        # Rough estimate, honestly labeled (PRD §59): validation decides — these
+        # bounds only say where the VALID count usually lands per class mix.
+        pool = funnel.high_confidence + funnel.medium_confidence
+        echo("Estimated VALID tasks")
+        echo("")
+        kv("Range", f"{round(0.55 * pool)}–{round(0.90 * pool)} (rough estimate from candidate classes)")
+        echo("")
+    echo("Requested benchmark size")
+    echo("")
+    kv("Tasks", f"{suggested_size}")
+    echo("")
+    echo(f"{lookback_note}")
+    echo("No inference tokens were consumed.")
+
+
+def render_zero_candidate_experience(
+    outcome, lookback_days: int
+) -> None:  # noqa: ANN001 - AnalyzeOutcome
+    """The PRD §31 zero-candidate experience: a dead end must teach the way out.
+    Blocker shares come from real FILTERED counts; every suggested action is
+    emitted only when a real count backs it — nothing is invented."""
+    candidates = outcome.candidates
+    filtered = [c for c in candidates if c.status is TaskStatus.FILTERED]
+    echo("")
+    echo("No candidates found.")
+    echo("")
+    if not filtered:
+        echo("No merged human PRs survived to the mining stage — try a")
+        echo("repository with richer engineering history.")
+        return
+    counts: dict[RejectionCode, int] = {}
+    for candidate in filtered:
+        assert candidate.rejection_code is not None  # FILTERED always carries one
+        counts[candidate.rejection_code] = counts.get(candidate.rejection_code, 0) + 1
+    echo("Primary blockers:")
+    echo("")
+    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0].value))
+    for i, (code, count) in enumerate(ordered):
+        label = "Other" if i == len(ordered) - 1 and len(ordered) > 1 else code.value
+        kv(label, f"{round(100 * count / len(filtered))}%")
+    echo("")
+    echo("What to try:")
+    echo("")
+    lookback = lookback_days
+    no_instruction = counts.get(RejectionCode.NO_INSTRUCTION, 0)
+    no_test = counts.get(RejectionCode.NO_TEST_CHANGE, 0)
+    echo(f"1. Increase repository.lookback_days (currently {lookback})")
+    if no_instruction:
+        echo(
+            f"2. Enable instruction_generation (tier D) — {no_instruction} PR(s) "
+            "filtered by NO_INSTRUCTION could be recovered"
+        )
+    if no_test:
+        echo(
+            f"3. Review project.test_command / custom test paths — {no_test} PR(s) "
+            "filtered by NO_TEST_CHANGE"
+        )
+    if not no_instruction and not no_test:
+        echo("2. Try a repository with richer engineering history")
+
+
 def render_merge_style_warnings(outcome) -> None:  # noqa: ANN001 - AnalyzeOutcome
     """Issue #31 field-credibility notes: squash-merged PRs are mined from
     commit subjects, and — only when gh ground truth exists — recall low enough
@@ -138,11 +265,15 @@ def render_merge_style_warnings(outcome) -> None:  # noqa: ANN001 - AnalyzeOutco
 
 def render_candidates_table(candidates: list[CandidateInfo]) -> None:
     table = RichTable(header_style="bold", show_lines=False)
+    # Score/Class (PRD §35) render '—' for legacy hard_caps candidates that
+    # were never scored — an unknown is never dressed up as a number.
     for column in (
         "PR",
+        "Score",
+        "Class",
         "Type",
         "Subsystem",
-        "Complexity",
+        "Size",
         "Impl LOC",
         "Test LOC",
         "Instr.",
@@ -152,8 +283,20 @@ def render_candidates_table(candidates: list[CandidateInfo]) -> None:
         table.add_column(column)
     for candidate in candidates:
         assessment = candidate.assessment
+        score = (
+            f"{assessment.candidate_score:.2f}"
+            if assessment.candidate_score is not None
+            else "—"
+        )
+        candidate_class = (
+            _CLASS_SHORT[assessment.candidate_class]
+            if assessment.candidate_class is not None
+            else "—"
+        )
         table.add_row(
             str(candidate.pr.number),
+            score,
+            candidate_class,
             assessment.task_type.value,
             assessment.subsystem,
             assessment.complexity.value,
@@ -164,6 +307,72 @@ def render_candidates_table(candidates: list[CandidateInfo]) -> None:
             candidate.rejection_code.value if candidate.rejection_code else "—",
         )
     console.print(table)
+
+
+def _fmt_score(value: float | None) -> str:
+    return f"{value:.2f}" if value is not None else "—"
+
+
+def render_candidate_inspect(candidate: CandidateInfo) -> None:
+    """`candidate inspect <PR>` (PRD §36, §71): the full decomposed assessment —
+    every score line shows its component, and every fragment comes from stored
+    fields (tier, linked issue, test counts, subsystem); '—' marks what was
+    never measured, so the decision stays explainable and honest."""
+    a = candidate.assessment
+    echo(f"PR #{candidate.pr.number}")
+    echo("")
+    echo("Candidate Score")
+    if a.candidate_score is None:
+        echo("—")
+        echo("Legacy hard_caps mining — re-run `repobench analyze` with")
+        echo("size_policy: adaptive for component scores.")
+    else:
+        version = a.assessment_version or "unknown"
+        klass = a.candidate_class.value if a.candidate_class else "unscored"
+        echo(f"{a.candidate_score:.2f} · {klass} · {version}")
+    echo("")
+    tier_detail = f"tier {a.instruction_confidence}"
+    if candidate.pr.linked_issue is not None:
+        tier_detail += f" — linked issue #{candidate.pr.linked_issue.number}"
+    kv("Instruction", f"{_fmt_score(a.instruction_score)}   {tier_detail}")
+    verifier_detail = ""
+    if a.test_files or a.test_loc:
+        verifier_detail = f"   {a.test_files} test files · {a.test_loc} test LOC"
+    kv("Verifier", f"{_fmt_score(a.verifier_score)}{verifier_detail}")
+    kv("Reconstructability", _fmt_score(a.reconstructability_score))
+    isolation_detail = f"   {a.subsystem}" if a.isolation_score is not None else ""
+    kv("Isolation", f"{_fmt_score(a.isolation_score)}{isolation_detail}")
+    kv("Environment", _fmt_score(a.environment_score))
+    kv("Scope", _fmt_score(a.scope_score))
+    echo("")
+    echo("Change size")
+    parts = [f"{a.implementation_loc:,} implementation LOC · {a.implementation_files} files"]
+    if a.scope_percentile is not None:
+        parts.append(f"P{a.scope_percentile:.0f} for this repository")
+    echo(" · ".join(parts))
+    if a.generated_loc or a.behavioral_loc is not None:
+        echo(
+            f"Generated LOC {a.generated_loc or 0}"
+            + (f" · behavioral {a.behavioral_loc:,}" if a.behavioral_loc is not None else "")
+        )
+    if a.risk_flags:
+        echo("")
+        echo("Risk flags")
+        echo(", ".join(a.risk_flags))
+    echo("")
+    echo("Classification")
+    echo(a.complexity.value.upper())
+    if a.candidate_score is not None:
+        high = 0.80  # default threshold; the config knob is cited in the PRD §24
+        if a.candidate_score >= high and a.complexity in (Complexity.LARGE, Complexity.XLARGE):
+            recommendation = "Strong candidate despite large diff."
+        elif a.candidate_score < 0.60:
+            recommendation = "Experimental — validate only after better candidates."
+        else:
+            recommendation = "Reasonable candidate."
+        echo("")
+        echo("Recommendation")
+        echo(recommendation)
 
 
 def _decode_details(raw: str | None) -> str | None:
@@ -287,6 +496,12 @@ def render_benchmark_build(outcome) -> None:  # noqa: ANN001 - BenchmarkBuildOut
             f"note: only {len(outcome.valid)} valid task(s) available "
             f"(requested {outcome.requested_size}); the benchmark uses all of them."
         )
+        echo("")
+    # Adaptive insufficiency warnings (PRD §64): why the benchmark is smaller
+    # than requested — always derived from what actually stopped the loop.
+    for warning in getattr(outcome, "build_warnings", []):
+        echo(f"{WARN} {warning}")
+    if getattr(outcome, "build_warnings", []):
         echo("")
     echo("Benchmark")
     echo(outcome.benchmark_id)

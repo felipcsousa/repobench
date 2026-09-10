@@ -21,8 +21,13 @@ targets_app = typer.Typer(
     help="Execution target management (targets live in repobench.yml — `add` writes them for you).",
     no_args_is_help=True,
 )
+candidate_app = typer.Typer(
+    help="Candidate inspection (the mining assessment behind one PR).",
+    no_args_is_help=True,
+)
 app.add_typer(benchmark_app, name="benchmark")
 app.add_typer(targets_app, name="targets")
+app.add_typer(candidate_app, name="candidate")
 
 
 class CliContext:
@@ -318,7 +323,20 @@ def analyze(ctx: typer.Context) -> None:
         + (f" ({outcome.remote_slug})" if outcome.enrichment == "github" else "")
         + f" · lookback {cfg.repository.lookback_days} days"
     )
-    render.render_analyze_summary(outcome, outcome.summary.suggested_benchmark_size, lookback_note)
+    render.render_analyze_summary_v2(
+        outcome, outcome.summary.suggested_benchmark_size, lookback_note
+    )
+    # PRD §31: zero candidates must teach the way out, not dead-end. The pool
+    # is DISCOVERED + LOW_PRIORITY (funnel counts them; the summary's
+    # task_candidates includes FILTERED rows and would never reach zero).
+    funnel = getattr(outcome, "funnel", None)
+    pool_size = (
+        funnel.discovered + funnel.low_priority
+        if funnel is not None
+        else outcome.summary.validated_candidates
+    )
+    if pool_size == 0:
+        render.render_zero_candidate_experience(outcome, cfg.repository.lookback_days)
     render.render_merge_style_warnings(outcome)
     if outcome.public_repository:
         render.render_public_repository_warning()
@@ -373,6 +391,30 @@ def candidates(
 
 
 # ----------------------------------------------------------------- benchmark
+
+
+@candidate_app.command("inspect")
+def candidate_inspect(
+    ctx: typer.Context,
+    pr: int = typer.Argument(..., help="PR number whose candidate to inspect."),
+) -> None:
+    """Show one PR's decomposed candidate assessment (score, class, components)."""
+    from repobench.cli import render
+    from repobench.core.errors import RepoBenchError
+    from repobench.storage.db import Storage
+
+    try:
+        root, paths, _cfg, _storage = _service_context(ctx)
+    except RepoBenchError as exc:
+        _fail(str(exc))
+        return
+    storage = Storage(paths.state_db)
+    rows = storage.candidates_for_pr(pr)
+    if not rows:
+        _fail(f"no candidate recorded for PR #{pr} — run `repobench analyze` first")
+        return
+    # The last row is the most recent mining pass for the PR (issue #35).
+    render.render_candidate_inspect(rows[-1])
 
 
 @benchmark_app.command("build")
