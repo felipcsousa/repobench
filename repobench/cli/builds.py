@@ -63,7 +63,6 @@ from repobench.validation.brittle import (
 )
 from repobench.validation.flakiness import flakiness_from_history
 from repobench.validation.pipeline import (
-    LEAKAGE_SCORE_THRESHOLD,
     TaskValidator,
     TaskValidationReport,
 )
@@ -350,15 +349,20 @@ def build_benchmark(
                 harness_version,
                 log,
             )
-        leakage = scan_base_archive(package.metadata, package.base_tar)
+        # gold_patch feeds the identifier needles (PRD §44): identifiers the
+        # gold introduces and that the base mentions are HIGH evidence.
+        leakage = scan_base_archive(
+            package.metadata, package.base_tar, gold_patch=package.gold_patch
+        )
         # Reuse gate: skip validation only when the flag is on, the task holds
         # status VALID from a previous build, its package loads, and leakage
-        # still clears the threshold — anything else falls through to the full
-        # validator, whose semantics (LEAKAGE_HIGH short-circuit) are unchanged.
+        # still clears — risk not HIGH (PRD §45; MEDIUM warns, LOW is clean) —
+        # anything else falls through to the full validator, whose semantics
+        # (LEAKAGE_HIGH short-circuit) are unchanged.
         was_reused = (
             reuse_valid
             and package.task_id in reusable
-            and leakage.score >= LEAKAGE_SCORE_THRESHOLD
+            and leakage.risk != "HIGH"
         )
         if was_reused:
             report = reused_validation_report(package.task_id)

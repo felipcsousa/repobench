@@ -156,11 +156,19 @@ def test_pipeline_verifier_exit_2_is_inconclusive(tmp_path: Path) -> None:
     assert "exited 2" in noop.details
 
 
-def test_pipeline_leakage_gate_rejects_before_running_commands(tmp_path: Path) -> None:
+def test_pipeline_leakage_gate_rejects_high_risk_before_running_commands(
+    tmp_path: Path,
+) -> None:
+    # PRD §45: risk HIGH is a hard reject, before any command runs.
     task = make_task(tmp_path)
     report = TaskValidator(make_project(), workspaces_root=tmp_path / "ws").validate(
         task,
-        leakages=LeakageReport(checks={}, score=30, findings=["leak found"]),
+        leakages=LeakageReport(
+            checks={},
+            score=30,
+            evidence=["leak found"],
+            risk="HIGH",
+        ),
     )
     assert report.status == TaskStatus.REJECTED
     assert report.rejection_code == RejectionCode.LEAKAGE_HIGH
@@ -169,28 +177,44 @@ def test_pipeline_leakage_gate_rejects_before_running_commands(tmp_path: Path) -
     assert "leak found" in report.checks[0].details
 
 
-def test_pipeline_leakage_threshold_boundary(tmp_path: Path) -> None:
+def test_pipeline_leakage_risk_boundary(tmp_path: Path) -> None:
+    # PRD §45-46: the gate is `risk`, never the score — HIGH rejects,
+    # MEDIUM warns and passes even with the worst informational score,
+    # LOW is clean.
     task = make_task(tmp_path)
     validator = TaskValidator(make_project(), workspaces_root=tmp_path / "ws")
 
-    rejected = validator.validate(task, leakages=LeakageReport(checks={}, score=39, findings=[]))
+    rejected = validator.validate(
+        task,
+        leakages=LeakageReport(
+            checks={},
+            score=100,
+            evidence=["gold SHA prefix 'cafe1234cafe' found in base archive file 'NOTES.txt'"],
+            risk="HIGH",
+        ),
+    )
     assert rejected.status == TaskStatus.REJECTED
     assert rejected.rejection_code == RejectionCode.LEAKAGE_HIGH
     assert [check.name for check in rejected.checks] == ["leakage"]
 
-    passed = validator.validate(task, leakages=LeakageReport(checks={}, score=40, findings=[]))
-    assert passed.status == TaskStatus.VALID
-    assert by_name(passed)["leakage"].passed is True
-
-
-def test_pipeline_leakage_gate_passes_when_score_is_high(tmp_path: Path) -> None:
-    task = make_task(tmp_path)
-    report = TaskValidator(make_project(), workspaces_root=tmp_path / "ws").validate(
+    warned = validator.validate(
         task,
-        leakages=LeakageReport(checks={}, score=78, findings=[]),
+        leakages=LeakageReport(
+            checks={},
+            score=0,  # informational only — MEDIUM never hard-rejects
+            evidence=["generic PR reference '#9' found in base archive file 'README.md'"],
+            risk="MEDIUM",
+        ),
     )
-    assert report.status == TaskStatus.VALID
-    assert by_name(report)["leakage"].passed is True
+    assert warned.status == TaskStatus.VALID
+    assert by_name(warned)["leakage"].passed is True
+
+    clean = validator.validate(
+        task,
+        leakages=LeakageReport(checks={}, score=78, evidence=[], risk="LOW"),
+    )
+    assert clean.status == TaskStatus.VALID
+    assert by_name(clean)["leakage"].passed is True
 
 
 # ------------------------------------------------------------------- baseline
