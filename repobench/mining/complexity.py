@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from repobench.config import TaskMiningConfig
 from repobench.core.types import Complexity
+from repobench.mining.scope import complexity_from_percentile
 
 
 def compute_complexity(
@@ -27,3 +28,13 @@ def compute_complexity(
     if implementation_loc <= cfg.small_loc_max and implementation_files <= 2:
         return Complexity.SMALL
     return Complexity.MEDIUM
+
+
+def compute_complexity_percentile(percentile: float) -> Complexity:
+    """Repository-relative complexity buckets (PRD §19): small = P0-P35,
+    medium = P35-P80, large = P80-P95, xlarge = P95+.
+
+    Thin alias of `repobench.mining.scope.complexity_from_percentile` — one
+    implementation, exposed here so complexity callers have a single import
+    site alongside `compute_complexity`."""
+    return complexity_from_percentile(percentile)

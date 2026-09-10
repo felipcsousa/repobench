@@ -204,6 +204,7 @@ def analyze_repository(root: Path, cfg: RepoBenchConfig) -> AnalyzeOutcome:
         lookback_days=lookback,
         codeowners=load_codeowners(root),
         package_dirs=detect_package_dirs(root),
+        project_cfg=cfg.project,
     )
     pool = [c for c in candidates if c.status is not TaskStatus.FILTERED]
     summary = summarize_analysis(
