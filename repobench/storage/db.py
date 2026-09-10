@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS candidates(
   task_type TEXT,
   subsystem TEXT,
   complexity TEXT,
+  candidate_class TEXT,
+  candidate_score REAL,
   data_json TEXT,
   created_at TEXT,
   updated_at TEXT
@@ -107,10 +109,21 @@ class Storage:
         Issue #13: trials.rollout was added in wave 2; databases from before it
         keep working through the DEFAULT 1 backfill (data_json stays the source
         of truth for reads).
+
+        PRD §68: adaptive mining adds candidates.candidate_class /
+        candidates.candidate_score so the adaptive validation order can query
+        classes without decoding every data_json. Legacy rows keep NULL — the
+        full candidate (and the remaining adaptive-v1 assessment fields) still
+        travels in data_json, which remains the source of truth for reads.
         """
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(trials)")}
         if "rollout" not in columns:
             conn.execute("ALTER TABLE trials ADD COLUMN rollout INTEGER DEFAULT 1")
+        candidate_columns = {row["name"] for row in conn.execute("PRAGMA table_info(candidates)")}
+        if "candidate_class" not in candidate_columns:
+            conn.execute("ALTER TABLE candidates ADD COLUMN candidate_class TEXT")
+        if "candidate_score" not in candidate_columns:
+            conn.execute("ALTER TABLE candidates ADD COLUMN candidate_score REAL")
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -137,6 +150,8 @@ class Storage:
 
     def save_candidate(self, candidate: CandidateInfo) -> None:
         now = utcnow().isoformat()
+        # Adaptive columns (PRD §68): NULL when the candidate was mined by
+        # legacy hard_caps (unscored assessment), never a fabricated number.
         self.upsert("candidates", {
             "candidate_id": candidate.candidate_id,
             "pr_number": candidate.pr.number,
@@ -145,6 +160,12 @@ class Storage:
             "task_type": candidate.assessment.task_type.value,
             "subsystem": candidate.assessment.subsystem,
             "complexity": candidate.assessment.complexity.value,
+            "candidate_class": (
+                candidate.assessment.candidate_class.value
+                if candidate.assessment.candidate_class
+                else None
+            ),
+            "candidate_score": candidate.assessment.candidate_score,
             "data_json": candidate.model_dump_json(),
             "created_at": now,
             "updated_at": now,

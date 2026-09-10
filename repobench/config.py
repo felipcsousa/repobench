@@ -58,6 +58,34 @@ class ProjectConfig(BaseModel):
     test_report: Literal["auto", "off"] = "auto"
 
 
+class ComplexityConfig(BaseModel):
+    """How complexity buckets are derived (PRD §19).
+
+    "absolute" is the legacy fixed-LOC bucketing; "repository_percentile"
+    derives buckets from the repository's own scope distribution — a 900-LOC PR
+    may be huge in one project and normal in another, so size becomes relative.
+    """
+
+    method: Literal["absolute", "repository_percentile"] = "absolute"
+
+
+class CandidateScoreConfig(BaseModel):
+    """Candidate-class thresholds (PRD §24): configurable and subject to field
+    calibration — HIGH_CONFIDENCE >= high_confidence, MEDIUM_CONFIDENCE >=
+    medium_confidence, EXPERIMENTAL below."""
+
+    high_confidence: float = 0.80
+    medium_confidence: float = 0.60
+
+
+class MiningValidationConfig(BaseModel):
+    """Which candidate classes enter the validation pool in adaptive mode
+    (PRD §33): candidate_class values, lowercase ("high", "medium",
+    "experimental"). None = all classes (legacy hard_caps behavior)."""
+
+    include: list[str] | None = None
+
+
 class TaskMiningConfig(BaseModel):
     require_test_change: bool = True
     min_implementation_loc: int = 20
@@ -66,12 +94,34 @@ class TaskMiningConfig(BaseModel):
     small_loc_max: int = 50
     large_loc_min: int = 200
     large_files_min: int = 5
+    # Adaptive candidate mining (PRD §33-34): "hard_caps" keeps every legacy
+    # absolute limit authoritative; "adaptive" treats size as evidence, not
+    # validity; "shadow" is reserved for the instrumented phase (PRD §77
+    # Phase B). The default STAYS hard_caps in this PR — flipping it is a
+    # later, gated change.
+    size_policy: Literal["hard_caps", "adaptive", "shadow"] = "hard_caps"
+    complexity: ComplexityConfig = Field(default_factory=ComplexityConfig)
+    candidate_score: CandidateScoreConfig = Field(default_factory=CandidateScoreConfig)
+    validation: MiningValidationConfig = Field(default_factory=MiningValidationConfig)
+    # Extreme scope guard (PRD §39): the absolute emergency cap, far above
+    # normal workload, that stops pathological diffs (75k LOC monorepo
+    # rewrites) regardless of size policy. Never a complexity threshold.
+    extreme_scope_loc: int = 5000
+    extreme_scope_files: int = 200
 
 
 class BenchmarkDimensions(BaseModel):
     task_type: float = 0.30
     subsystem: float = 0.40
     complexity: float = 0.30
+
+
+class ValidationBudgetConfig(BaseModel):
+    """Bounded validation work (PRD §63): stop validating after N candidates
+    even when the requested benchmark size was not reached — graceful
+    insufficiency beats unbounded spend. None = no budget."""
+
+    max_candidates: int | None = None
 
 
 class BenchmarkConfig(BaseModel):
@@ -81,6 +131,13 @@ class BenchmarkConfig(BaseModel):
     # ["A", "B"]) restricts the benchmark pool to those instruction
     # confidence tiers before validation.
     allowed_confidences: list[str] | None = None
+    # Adaptive benchmark construction (PRD §62-65): minimum honest benchmark
+    # size (below it: INSUFFICIENT_BENCHMARK, no strong recommendation) and the
+    # minimum representativeness threshold that extends validation past `size`
+    # to fill coverage gaps. None = no extra coverage continuation.
+    min_size: int = 10
+    min_representativeness: int | None = None
+    validation_budget: ValidationBudgetConfig = Field(default_factory=ValidationBudgetConfig)
 
 
 class InstructionGenerationConfig(BaseModel):
