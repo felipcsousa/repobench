@@ -11,8 +11,6 @@ from repobench.config import ProjectConfig
 from repobench.core.types import (
     Assessment,
     CandidateClass,
-    CandidateInfo,
-    PRInfo,
     RejectionCode,
     TaskStatus,
     TaskType,
@@ -24,41 +22,7 @@ from repobench.mining.benchmarkability import (
     compute_candidate_funnel,
     compute_scope_profile,
 )
-
-
-def _candidate(
-    number: int,
-    *,
-    instruction: str = "fix the thing",
-    confidence: str = "B",
-    test_files: int = 1,
-    impl_loc: int = 40,
-    task_type: TaskType = TaskType.BUGFIX,
-    status: TaskStatus = TaskStatus.DISCOVERED,
-    rejection_code: RejectionCode | None = None,
-    behavioral_loc: int | None = None,
-    generated_loc: int | None = None,
-    candidate_class: CandidateClass | None = None,
-) -> CandidateInfo:
-    return CandidateInfo(
-        candidate_id=f"c{number:04d}",
-        pr=PRInfo(number=number),
-        status=status,
-        rejection_code=rejection_code,
-        assessment=Assessment(
-            task_type=task_type,
-            subsystem="math",
-            instruction=instruction,
-            instruction_confidence=confidence,  # type: ignore[arg-type]
-            test_files=test_files,
-            test_loc=20,
-            implementation_loc=impl_loc,
-            implementation_files=1,
-            behavioral_loc=behavioral_loc,
-            generated_loc=generated_loc,
-            candidate_class=candidate_class,
-        ),
-    )
+from tests.fixtures.candidates import make_assessed_candidate
 
 
 # -------------------------------------------------------------------- funnel
@@ -66,10 +30,10 @@ def _candidate(
 
 def test_funnel_stages_narrow_over_real_counts() -> None:
     candidates = [
-        _candidate(1),  # full evidence
-        _candidate(2, instruction="", confidence="C"),  # no instruction
-        _candidate(3, test_files=0),  # no verifier evidence
-        _candidate(4, impl_loc=0),  # no implementation
+        make_assessed_candidate(1),  # full evidence
+        make_assessed_candidate(2, instruction="", confidence="C"),  # no instruction
+        make_assessed_candidate(3, test_files=0),  # no verifier evidence
+        make_assessed_candidate(4, implementation_loc=0),  # no implementation
     ]
     funnel = compute_candidate_funnel(candidates, merged_prs=9)
     assert funnel.merged_prs == 9
@@ -84,9 +48,9 @@ def test_funnel_stages_narrow_over_real_counts() -> None:
 
 def test_funnel_class_counts_come_from_assessment() -> None:
     candidates = [
-        _candidate(1, candidate_class=CandidateClass.HIGH_CONFIDENCE),
-        _candidate(2, candidate_class=CandidateClass.HIGH_CONFIDENCE),
-        _candidate(3, candidate_class=CandidateClass.MEDIUM_CONFIDENCE),
+        make_assessed_candidate(1, candidate_class=CandidateClass.HIGH_CONFIDENCE),
+        make_assessed_candidate(2, candidate_class=CandidateClass.HIGH_CONFIDENCE),
+        make_assessed_candidate(3, candidate_class=CandidateClass.MEDIUM_CONFIDENCE),
     ]
     funnel = compute_candidate_funnel(candidates, merged_prs=3)
     assert funnel.high_confidence == 2
@@ -101,10 +65,10 @@ def test_scope_profile_percentiles_and_cap_pressure() -> None:
     # 4 otherwise-eligible PRs at LOC 100/200/500/900 — half exceed the legacy
     # 400 cap, so cap_pressure is exactly 50.
     candidates = [
-        _candidate(1, impl_loc=100),
-        _candidate(2, impl_loc=200),
-        _candidate(3, impl_loc=500),
-        _candidate(4, impl_loc=900),
+        make_assessed_candidate(1, implementation_loc=100),
+        make_assessed_candidate(2, implementation_loc=200),
+        make_assessed_candidate(3, implementation_loc=500),
+        make_assessed_candidate(4, implementation_loc=900),
     ]
     profile = compute_scope_profile(candidates)
     assert profile.n == 4
@@ -118,7 +82,9 @@ def test_scope_profile_percentiles_and_cap_pressure() -> None:
 def test_scope_profile_prefers_stored_behavioral_loc() -> None:
     # PRD §20: generated LOC discounted — behavioral 740, not raw 1700.
     candidates = [
-        _candidate(1, impl_loc=1700, behavioral_loc=740, generated_loc=1200),
+        make_assessed_candidate(
+            1, implementation_loc=1700, behavioral_loc=740, generated_loc=1200
+        ),
     ]
     profile = compute_scope_profile(candidates)
     assert profile.p50 == 740
@@ -135,8 +101,10 @@ def test_scope_profile_size_rejections_stay_in_population() -> None:
     # TASK_TOO_LARGE/TOO_SMALL/EXTREME are size-class codes (PRD §37): the PRs
     # whose fate the old cap decided stay in the cap-pressure population.
     candidates = [
-        _candidate(1, impl_loc=900, rejection_code=RejectionCode.TASK_TOO_LARGE),
-        _candidate(
+        make_assessed_candidate(
+            1, implementation_loc=900, rejection_code=RejectionCode.TASK_TOO_LARGE
+        ),
+        make_assessed_candidate(
             2,
             status=TaskStatus.FILTERED,
             rejection_code=RejectionCode.NO_INSTRUCTION,
@@ -158,11 +126,11 @@ def test_behavioral_loc_falls_back_to_implementation_loc() -> None:
 
 def test_benchmarkability_components_hand_computed() -> None:
     candidates = [
-        _candidate(1, confidence="A"),
-        _candidate(2, confidence="C"),
-        _candidate(3, instruction="", confidence="C"),
-        _candidate(4, test_files=0, instruction="", confidence="C"),
-        _candidate(
+        make_assessed_candidate(1, confidence="A"),
+        make_assessed_candidate(2, confidence="C"),
+        make_assessed_candidate(3, instruction="", confidence="C"),
+        make_assessed_candidate(4, test_files=0, instruction="", confidence="C"),
+        make_assessed_candidate(
             5,
             status=TaskStatus.FILTERED,
             rejection_code=RejectionCode.HISTORY_UNSUPPORTED,
@@ -184,16 +152,16 @@ def test_benchmarkability_components_hand_computed() -> None:
 def test_benchmarkability_bands_and_diversity() -> None:
     # two distinct task types over 2 non-filtered candidates → max entropy → 100
     two_types = [
-        _candidate(1, task_type=TaskType.BUGFIX),
-        _candidate(2, task_type=TaskType.FEATURE),
+        make_assessed_candidate(1, task_type=TaskType.BUGFIX),
+        make_assessed_candidate(2, task_type=TaskType.FEATURE),
     ]
     report = compute_benchmarkability(two_types, None)
     assert report.components["candidate_diversity"] == 100
     assert report.band in ("MEDIUM", "HIGH")
 
     one_type = [
-        _candidate(1, task_type=TaskType.BUGFIX),
-        _candidate(2, task_type=TaskType.BUGFIX),
+        make_assessed_candidate(1, task_type=TaskType.BUGFIX),
+        make_assessed_candidate(2, task_type=TaskType.BUGFIX),
     ]
     single = compute_benchmarkability(one_type, None)
     assert single.components["candidate_diversity"] == 0
@@ -212,11 +180,11 @@ def test_benchmarkability_notes_flag_weak_test_evidence() -> None:
     # integration is 60% of the universe but none of its candidates has test
     # evidence — the exact PRD §59 "weak test evidence" risk line.
     candidates = [
-        _candidate(1, task_type=TaskType.BUGFIX, test_files=1),
-        _candidate(2, task_type=TaskType.BUGFIX, test_files=1),
-        _candidate(3, task_type=TaskType.INTEGRATION, test_files=0),
-        _candidate(4, task_type=TaskType.INTEGRATION, test_files=0),
-        _candidate(5, task_type=TaskType.INTEGRATION, test_files=0),
+        make_assessed_candidate(1, task_type=TaskType.BUGFIX, test_files=1),
+        make_assessed_candidate(2, task_type=TaskType.BUGFIX, test_files=1),
+        make_assessed_candidate(3, task_type=TaskType.INTEGRATION, test_files=0),
+        make_assessed_candidate(4, task_type=TaskType.INTEGRATION, test_files=0),
+        make_assessed_candidate(5, task_type=TaskType.INTEGRATION, test_files=0),
     ]
     report = compute_benchmarkability(candidates, None)
     assert any("integration" in note for note in report.notes)

@@ -34,10 +34,8 @@ from repobench.config import RepoBenchConfig
 from repobench.core.errors import UsageError
 from repobench.core.paths import ProjectPaths
 from repobench.core.types import (
-    Assessment,
     CandidateClass,
     CandidateInfo,
-    PRInfo,
     TaskMetadata,
     TaskPackage,
     TaskStatus,
@@ -46,41 +44,7 @@ from repobench.core.types import (
 from repobench.storage.db import Storage
 from repobench.tasks.leakage import LeakageReport
 from repobench.validation.pipeline import TaskValidationReport
-
-
-def _candidate(
-    number: int,
-    *,
-    task_type: TaskType = TaskType.BUGFIX,
-    score: float | None = None,
-    candidate_class: CandidateClass | None = None,
-    subsystem: str = "math",
-) -> CandidateInfo:
-    """A scored adaptive-shaped candidate — hand-built, no repository behind it
-    (the build-level tests below stub package reconstruction)."""
-    return CandidateInfo(
-        candidate_id=f"c{number:04d}",
-        pr=PRInfo(
-            number=number,
-            title=f"PR {number}",
-            base_sha=f"b{number:04d}" + "0" * 32,
-            head_sha=f"h{number:04d}" + "0" * 32,
-            merge_sha=f"m{number:04d}" + "0" * 32,
-        ),
-        status=TaskStatus.DISCOVERED,
-        assessment=Assessment(
-            task_type=task_type,
-            subsystem=subsystem,
-            candidate_score=score,
-            candidate_class=candidate_class,
-            instruction="do the thing",
-            instruction_confidence="B",
-            test_files=2,
-            test_loc=30,
-            implementation_loc=40,
-            implementation_files=2,
-        ),
-    )
+from tests.fixtures.candidates import make_assessed_candidate
 
 
 _DIMS = RepoBenchConfig().benchmark.dimensions
@@ -93,9 +57,9 @@ def test_coverage_need_boosts_underrepresented_type() -> None:
     """PRD §28: with bugfix saturated and integration missing, the integration
     candidate carries the task-type deficit and the bugfix carries none."""
     universe = [
-        _candidate(1, task_type=TaskType.BUGFIX),
-        _candidate(2, task_type=TaskType.INTEGRATION),
-        _candidate(3, task_type=TaskType.INTEGRATION),
+        make_assessed_candidate(1, task_type=TaskType.BUGFIX),
+        make_assessed_candidate(2, task_type=TaskType.INTEGRATION),
+        make_assessed_candidate(3, task_type=TaskType.INTEGRATION),
     ]
     profile = UniverseProfile.of(universe, _DIMS)
     validated = [universe[0].assessment]  # the one bugfix already validated
@@ -120,11 +84,11 @@ def test_validation_priority_weights_and_none_score() -> None:
 def test_prd_29_integration_can_outrank_higher_score_bugfix() -> None:
     """The PRD §29 example: A scores .93 (bugfix), B scores .86 (integration);
     with integration under-represented, B validates before A."""
-    a = _candidate(1, task_type=TaskType.BUGFIX, score=0.93)
-    b = _candidate(2, task_type=TaskType.INTEGRATION, score=0.86)
-    universe = [a, b, _candidate(3, task_type=TaskType.INTEGRATION)]
+    a = make_assessed_candidate(1, task_type=TaskType.BUGFIX, score=0.93)
+    b = make_assessed_candidate(2, task_type=TaskType.INTEGRATION, score=0.86)
+    universe = [a, b, make_assessed_candidate(3, task_type=TaskType.INTEGRATION)]
     profile = UniverseProfile.of(universe, _DIMS)
-    validated = [_candidate(9, task_type=TaskType.BUGFIX).assessment]
+    validated = [make_assessed_candidate(9, task_type=TaskType.BUGFIX).assessment]
 
     priority_a = validation_priority(
         a.assessment.candidate_score,
@@ -139,13 +103,19 @@ def test_prd_29_integration_can_outrank_higher_score_bugfix() -> None:
 
 def test_class_rank_orders_high_medium_experimental() -> None:
     assert (
-        class_rank(_candidate(1, candidate_class=CandidateClass.HIGH_CONFIDENCE))
-        < class_rank(_candidate(2, candidate_class=CandidateClass.MEDIUM_CONFIDENCE))
-        < class_rank(_candidate(3, candidate_class=CandidateClass.EXPERIMENTAL))
+        class_rank(
+            make_assessed_candidate(1, candidate_class=CandidateClass.HIGH_CONFIDENCE)
+        )
+        < class_rank(
+            make_assessed_candidate(2, candidate_class=CandidateClass.MEDIUM_CONFIDENCE)
+        )
+        < class_rank(
+            make_assessed_candidate(3, candidate_class=CandidateClass.EXPERIMENTAL)
+        )
     )
     # Unscored (hard_caps) ranks as medium — never better than a known HIGH.
-    assert class_rank(_candidate(4)) == class_rank(
-        _candidate(5, candidate_class=CandidateClass.MEDIUM_CONFIDENCE)
+    assert class_rank(make_assessed_candidate(4)) == class_rank(
+        make_assessed_candidate(5, candidate_class=CandidateClass.MEDIUM_CONFIDENCE)
     )
 
 
@@ -154,9 +124,9 @@ def test_universe_profile_matches_hand_computed_distributions() -> None:
     distributions the queue consumes (PRD §66 dimension order), and coverage
     need through it equals the hand computation from raw shares."""
     universe = [
-        _candidate(1, task_type=TaskType.BUGFIX),
-        _candidate(2, task_type=TaskType.INTEGRATION),
-        _candidate(3, task_type=TaskType.INTEGRATION),
+        make_assessed_candidate(1, task_type=TaskType.BUGFIX),
+        make_assessed_candidate(2, task_type=TaskType.INTEGRATION),
+        make_assessed_candidate(3, task_type=TaskType.INTEGRATION),
     ]
     profile = UniverseProfile.of(universe, _DIMS)
     assert profile.size == 3
@@ -207,9 +177,15 @@ def test_adaptive_pick_order_deterministic_with_candidate_id_tiebreak() -> None:
     (HIGH → MEDIUM → EXPERIMENTAL), then by validation priority descending,
     then by candidate_id — a total, stable, deterministic order."""
     pool = [
-        _candidate(3, score=0.5, candidate_class=CandidateClass.HIGH_CONFIDENCE),
-        _candidate(1, score=0.5, candidate_class=CandidateClass.HIGH_CONFIDENCE),
-        _candidate(2, score=0.9, candidate_class=CandidateClass.MEDIUM_CONFIDENCE),
+        make_assessed_candidate(
+            3, score=0.5, candidate_class=CandidateClass.HIGH_CONFIDENCE
+        ),
+        make_assessed_candidate(
+            1, score=0.5, candidate_class=CandidateClass.HIGH_CONFIDENCE
+        ),
+        make_assessed_candidate(
+            2, score=0.9, candidate_class=CandidateClass.MEDIUM_CONFIDENCE
+        ),
     ]
 
     def drain(strategy: AdaptiveStrategy) -> list[int]:
@@ -232,15 +208,17 @@ def test_adaptive_describe_carries_score_class_and_type() -> None:
     """PRD §60: the progress-line suffix shows score, class and task type;
     unscored candidates keep the plain line (None class ranks as medium)."""
     strategy = AdaptiveStrategy(_adaptive_cfg(), requested=1)
-    scored = _candidate(1, score=0.95, candidate_class=CandidateClass.HIGH_CONFIDENCE)
+    scored = make_assessed_candidate(
+        1, score=0.95, candidate_class=CandidateClass.HIGH_CONFIDENCE
+    )
     assert strategy.describe(scored) == " · score 0.95 · HIGH · bugfix"
-    assert strategy.describe(_candidate(2)) == ""
+    assert strategy.describe(make_assessed_candidate(2)) == ""
 
 
 def test_hard_caps_strategy_never_stops_without_the_flag() -> None:
     """Legacy hard_caps semantics: no early stop unless --stop-when-sufficient
     was passed, and a bare progress line."""
-    universe = [_candidate(1), _candidate(2)]
+    universe = [make_assessed_candidate(1), make_assessed_candidate(2)]
     profile = UniverseProfile.of(universe, _DIMS)
     strategy = HardCapsStrategy(requested=1, stop_early=False)
     assert (
@@ -274,13 +252,17 @@ def test_adaptive_filter_pool_rejects_unknown_include_tokens() -> None:
     cfg.task_mining.validation.include = ["high", "bogus"]
     strategy = AdaptiveStrategy(cfg, requested=1)
     with pytest.raises(UsageError) as excinfo:
-        strategy.filter_pool([_candidate(1)], [_candidate(1)])
+        strategy.filter_pool([make_assessed_candidate(1)], [make_assessed_candidate(1)])
     assert "unknown class(es) ['bogus']" in str(excinfo.value)
     assert "valid: ['experimental', 'high', 'medium']" in str(excinfo.value)
 
 
 def test_representativeness_bounds() -> None:
-    candidates = [_candidate(1), _candidate(2), _candidate(3)]
+    candidates = [
+        make_assessed_candidate(1),
+        make_assessed_candidate(2),
+        make_assessed_candidate(3),
+    ]
     profile = UniverseProfile.of(candidates, _DIMS)
     assert representativeness([], profile) == 0.0
     # every candidate identical → the valid distribution equals the universe's.
@@ -409,16 +391,6 @@ def _adaptive_run(
     return outcome, lines, storage
 
 
-def _scored(
-    number: int,
-    *,
-    score: float,
-    klass: CandidateClass,
-    task_type: TaskType = TaskType.BUGFIX,
-) -> CandidateInfo:
-    return _candidate(number, task_type=task_type, score=score, candidate_class=klass)
-
-
 def test_adaptive_build_stops_when_sufficient(
     tmp_path: Path, stubbed_build
 ) -> None:
@@ -426,9 +398,15 @@ def test_adaptive_build_stops_when_sufficient(
     2 VALID — the third never pays validation."""
     install, order = stubbed_build
     candidates = [
-        _scored(1, score=0.95, klass=CandidateClass.HIGH_CONFIDENCE),
-        _scored(2, score=0.90, klass=CandidateClass.HIGH_CONFIDENCE),
-        _scored(3, score=0.85, klass=CandidateClass.HIGH_CONFIDENCE),
+        make_assessed_candidate(
+            1, score=0.95, candidate_class=CandidateClass.HIGH_CONFIDENCE
+        ),
+        make_assessed_candidate(
+            2, score=0.90, candidate_class=CandidateClass.HIGH_CONFIDENCE
+        ),
+        make_assessed_candidate(
+            3, score=0.85, candidate_class=CandidateClass.HIGH_CONFIDENCE
+        ),
     ]
     cfg = _adaptive_cfg(min_size=1)
     outcome, lines, _storage = _adaptive_run(
@@ -448,8 +426,12 @@ def test_adaptive_build_budget_caps_validation(
     """PRD §63: max_candidates bounds the work even when nothing is VALID yet."""
     install, order = stubbed_build
     candidates = [
-        _scored(1, score=0.95, klass=CandidateClass.HIGH_CONFIDENCE),
-        _scored(2, score=0.90, klass=CandidateClass.HIGH_CONFIDENCE),
+        make_assessed_candidate(
+            1, score=0.95, candidate_class=CandidateClass.HIGH_CONFIDENCE
+        ),
+        make_assessed_candidate(
+            2, score=0.90, candidate_class=CandidateClass.HIGH_CONFIDENCE
+        ),
     ]
     cfg = _adaptive_cfg(min_size=1)
     cfg.benchmark.validation_budget.max_candidates = 1
@@ -468,8 +450,12 @@ def test_adaptive_build_insufficient_benchmark_and_graceful_path(
     above it, a smaller-than-requested benchmark still ships with warnings."""
     install, order = stubbed_build
     candidates = [
-        _scored(1, score=0.95, klass=CandidateClass.HIGH_CONFIDENCE),
-        _scored(2, score=0.90, klass=CandidateClass.HIGH_CONFIDENCE),
+        make_assessed_candidate(
+            1, score=0.95, candidate_class=CandidateClass.HIGH_CONFIDENCE
+        ),
+        make_assessed_candidate(
+            2, score=0.90, candidate_class=CandidateClass.HIGH_CONFIDENCE
+        ),
     ]
     # min_size 3 > 2 achievable VALID → INSUFFICIENT_BENCHMARK.
     cfg = _adaptive_cfg(min_size=3)
@@ -493,9 +479,15 @@ def test_adaptive_pool_class_filter(tmp_path: Path, stubbed_build) -> None:
     keeps experimental/medium candidates out of the pool entirely."""
     install, order = stubbed_build
     candidates = [
-        _scored(1, score=0.95, klass=CandidateClass.HIGH_CONFIDENCE),
-        _scored(2, score=0.60, klass=CandidateClass.MEDIUM_CONFIDENCE),
-        _scored(3, score=0.40, klass=CandidateClass.EXPERIMENTAL),
+        make_assessed_candidate(
+            1, score=0.95, candidate_class=CandidateClass.HIGH_CONFIDENCE
+        ),
+        make_assessed_candidate(
+            2, score=0.60, candidate_class=CandidateClass.MEDIUM_CONFIDENCE
+        ),
+        make_assessed_candidate(
+            3, score=0.40, candidate_class=CandidateClass.EXPERIMENTAL
+        ),
     ]
     # experimental candidate is LOW_PRIORITY at mining time — pool-eligible
     # only when explicitly included.
@@ -526,11 +518,17 @@ def test_adaptive_queue_coverage_boost_steers_pick_order(
     bugfix) because the universe leans integration 2:1 and nothing validated
     yet — the coverage term outweighs the small score gap."""
     install, order = stubbed_build
-    a = _scored(1, score=0.80, klass=CandidateClass.HIGH_CONFIDENCE)
-    b = _scored(2, score=0.78, klass=CandidateClass.HIGH_CONFIDENCE,
-                task_type=TaskType.INTEGRATION)
-    universe_extra = _scored(3, score=0.70, klass=CandidateClass.HIGH_CONFIDENCE,
-                             task_type=TaskType.INTEGRATION)
+    a = make_assessed_candidate(
+        1, score=0.80, candidate_class=CandidateClass.HIGH_CONFIDENCE
+    )
+    b = make_assessed_candidate(
+        2, score=0.78, candidate_class=CandidateClass.HIGH_CONFIDENCE,
+        task_type=TaskType.INTEGRATION,
+    )
+    universe_extra = make_assessed_candidate(
+        3, score=0.70, candidate_class=CandidateClass.HIGH_CONFIDENCE,
+        task_type=TaskType.INTEGRATION,
+    )
     cfg = _adaptive_cfg(min_size=1)
     outcome, _lines, _storage = _adaptive_run(
         tmp_path, cfg, [a, b, universe_extra], install, {}, size=1
@@ -545,8 +543,12 @@ def test_hard_caps_build_keeps_fixed_order_and_no_budget(
     the 0.95-score PR does NOT jump the queue — and every candidate validates."""
     install, order = stubbed_build
     candidates = [
-        _scored(2, score=0.95, klass=CandidateClass.HIGH_CONFIDENCE),
-        _scored(1, score=0.60, klass=CandidateClass.MEDIUM_CONFIDENCE),
+        make_assessed_candidate(
+            2, score=0.95, candidate_class=CandidateClass.HIGH_CONFIDENCE
+        ),
+        make_assessed_candidate(
+            1, score=0.60, candidate_class=CandidateClass.MEDIUM_CONFIDENCE
+        ),
     ]
     cfg = RepoBenchConfig()  # hard_caps default
     outcome, _lines, _storage = _adaptive_run(

@@ -16,7 +16,7 @@ from repobench.config import RepoBenchConfig
 from repobench.core.types import RejectionCode, TaskStatus
 from repobench.mining.shadow import compute_shadow_delta
 from repobench.storage.db import Storage
-from repobench.core.types import CandidateInfo, TaskStatus as TS
+from tests.fixtures.candidates import make_assessed_candidate
 from tests.fixtures.gitutil import git, make_pr
 
 
@@ -95,26 +95,21 @@ def test_shadow_keeps_hard_caps_controlling_and_reports_delta(tmp_path: Path) ->
 
 
 def test_shadow_delta_pure_math_on_hand_built_candidates() -> None:
-    def cand(number: int, status: TS, code: RejectionCode | None = None) -> CandidateInfo:
-        from repobench.core.types import Assessment, PRInfo
-
-        return CandidateInfo(
-            candidate_id=f"c{number}",
-            pr=PRInfo(number=number),
-            status=status,
-            rejection_code=code,
-            assessment=Assessment(),
-        )
-
     hard = [
-        cand(1, TS.DISCOVERED),
-        cand(2, TS.FILTERED, RejectionCode.TASK_TOO_LARGE),
-        cand(3, TS.FILTERED, RejectionCode.NO_TEST_CHANGE),
+        make_assessed_candidate(1, status=TaskStatus.DISCOVERED),
+        make_assessed_candidate(
+            2, status=TaskStatus.FILTERED, rejection_code=RejectionCode.TASK_TOO_LARGE
+        ),
+        make_assessed_candidate(
+            3, status=TaskStatus.FILTERED, rejection_code=RejectionCode.NO_TEST_CHANGE
+        ),
     ]
     adaptive = [
-        cand(1, TS.DISCOVERED),
-        cand(2, TS.DISCOVERED),
-        cand(3, TS.FILTERED, RejectionCode.NO_TEST_CHANGE),
+        make_assessed_candidate(1, status=TaskStatus.DISCOVERED),
+        make_assessed_candidate(2, status=TaskStatus.DISCOVERED),
+        make_assessed_candidate(
+            3, status=TaskStatus.FILTERED, rejection_code=RejectionCode.NO_TEST_CHANGE
+        ),
     ]
     delta = compute_shadow_delta(hard, adaptive)
     assert delta.additional_candidates == 1  # only PR 2

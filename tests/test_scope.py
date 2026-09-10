@@ -15,9 +15,7 @@ from repobench.core.types import (
     SIZE_CLASS_REJECTIONS,
     Assessment,
     CandidateClass,
-    CandidateInfo,
     Complexity,
-    PRInfo,
     RejectionCode,
     TaskStatus,
 )
@@ -30,6 +28,7 @@ from repobench.mining.scope import (
     scope_features,
 )
 from repobench.storage.db import Storage
+from tests.fixtures.candidates import make_assessed_candidate
 
 # ---------------------------------------------------------------- is_generated_path
 
@@ -327,23 +326,21 @@ def test_size_class_rejections_canonical_in_types() -> None:
 # ---------------------------------------------------------------- storage (PRD §68)
 
 
-def _candidate(candidate_id: str, number: int, **assessment_kwargs) -> CandidateInfo:
-    return CandidateInfo(
-        candidate_id=candidate_id,
-        pr=PRInfo(number=number),
-        assessment=Assessment(implementation_loc=6, **assessment_kwargs),
-    )
-
-
 def test_save_candidate_roundtrips_class_and_score(tmp_path: Path) -> None:
     storage = Storage(tmp_path / "state.db")
-    scored = _candidate(
-        "c_1_a",
+    # with_shas=False keeps the persisted rows exactly the bare storage
+    # fixtures they always were — no git history is behind them.
+    scored = make_assessed_candidate(
         1,
+        candidate_id="c_1_a",
+        score=0.91,
         candidate_class=CandidateClass.HIGH_CONFIDENCE,
-        candidate_score=0.91,
+        implementation_loc=6,
+        with_shas=False,
     )
-    unscored = _candidate("c_2_b", 2)  # legacy hard_caps mining: no class/score
+    unscored = make_assessed_candidate(
+        2, candidate_id="c_2_b", implementation_loc=6, with_shas=False
+    )  # legacy hard_caps mining: no class/score
     storage.save_candidate(scored)
     storage.save_candidate(unscored)
 
@@ -418,7 +415,14 @@ def test_migrate_candidates_table_from_legacy_schema(tmp_path: Path) -> None:
     # scored rows write through the migrated schema and decode fine.
     assert storage.query("SELECT candidate_id FROM candidates WHERE candidate_id = 'c_old'")
     storage.save_candidate(
-        _candidate("c_new", 8, candidate_class=CandidateClass.EXPERIMENTAL, candidate_score=0.4)
+        make_assessed_candidate(
+            8,
+            candidate_id="c_new",
+            score=0.4,
+            candidate_class=CandidateClass.EXPERIMENTAL,
+            implementation_loc=6,
+            with_shas=False,
+        )
     )
     rows = storage.query("SELECT candidate_id FROM candidates")
     assert len(rows) == 2

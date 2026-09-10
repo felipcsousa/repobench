@@ -45,6 +45,9 @@ def git_repo(tmp_path: Path) -> Path:
     return repo
 
 
+# Legacy pre-adaptive shape (fixed candidate_id, UNKNOWN-type assessments with
+# no instruction/LOC): workload-share fixtures, not the adaptive scored
+# candidate built by tests.fixtures.candidates.make_assessed_candidate.
 def _candidate(
     task_type: TaskType = TaskType.UNKNOWN,
     subsystem: str = "unknown",
