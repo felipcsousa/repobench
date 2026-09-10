@@ -295,8 +295,8 @@ def test_classify_custom_thresholds() -> None:
 
 def test_risk_flags_individual_triggers() -> None:
     assert risk_flags(_features(), percentile=82.0, n_baseline=100, test_loc=50) == ["large_diff"]
+    # xlarge subsumes large — one flag per dimension keeps inspect terse.
     assert risk_flags(_features(), percentile=96.0, n_baseline=100, test_loc=50) == [
-        "large_diff",
         "xlarge_diff",
     ]
     # Generated dominates: 1200 of 1700 implementation LOC are machine-written.
@@ -332,7 +332,6 @@ def test_risk_flags_sorted_and_deduplicated() -> None:
     assert len(flags) == len(set(flags))
     assert flags == [
         "cross_language",
-        "large_diff",
         "multi_package",
         "small_repository_baseline",
         "weak_verifier_evidence",

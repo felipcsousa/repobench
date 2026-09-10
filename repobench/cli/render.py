@@ -178,11 +178,15 @@ def render_analyze_summary_v2(
     if scored:
         # Rough estimate, honestly labeled (PRD §59): validation decides — these
         # bounds only say where the VALID count usually lands per class mix.
+        # Only HIGH+MEDIUM calibrate the estimate: EXPERIMENTAL candidates are
+        # exactly the ones we do not yet trust to convert, so a pool of zero
+        # calibrated candidates renders no invented range.
         pool = funnel.high_confidence + funnel.medium_confidence
-        echo("Estimated VALID tasks")
-        echo("")
-        kv("Range", f"{round(0.55 * pool)}–{round(0.90 * pool)} (rough estimate from candidate classes)")
-        echo("")
+        if pool > 0:
+            echo("Estimated VALID tasks")
+            echo("")
+            kv("Range", f"{round(0.55 * pool)}–{round(0.90 * pool)} (rough estimate from candidate classes)")
+            echo("")
     echo("Requested benchmark size")
     echo("")
     kv("Tasks", f"{suggested_size}")

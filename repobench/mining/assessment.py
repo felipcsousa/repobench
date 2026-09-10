@@ -228,10 +228,12 @@ def risk_flags(
     on the assessment so flags recompute exactly from stored fields."""
     flags: set[str] = set()
     if percentile is not None:
-        if percentile >= 80:
-            flags.add("large_diff")
+        # xlarge subsumes large (PRD §11 risk_flags is a set of warnings, not a
+        # scale — one flag per dimension keeps the inspect output terse).
         if percentile >= 95:
             flags.add("xlarge_diff")
+        elif percentile >= 80:
+            flags.add("large_diff")
     if features.generated_loc > 0 and features.generated_loc > (
         features.implementation_loc - features.generated_loc
     ):

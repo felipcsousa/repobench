@@ -630,7 +630,6 @@ def test_adaptive_experimental_class_is_low_priority(tmp_path: Path) -> None:
     assert candidate.assessment.languages_touched == ["python", "typescript"]
     assert candidate.assessment.risk_flags == [
         "cross_language",
-        "large_diff",
         "multi_package",
         "small_repository_baseline",
         "weak_verifier_evidence",
@@ -666,7 +665,7 @@ def test_adaptive_repository_percentile_yields_xlarge(tmp_path: Path) -> None:
     assert biggest.status is TaskStatus.DISCOVERED
     assert biggest.assessment.complexity is Complexity.XLARGE  # P100 of 25 PRs
     assert biggest.assessment.scope_percentile == 100.0
-    assert biggest.assessment.risk_flags == ["large_diff", "xlarge_diff"]
+    assert biggest.assessment.risk_flags == ["xlarge_diff"]
 
     # A gated sub-floor PR keeps the absolute buckets and stays unscored.
     small = by_number[7]
