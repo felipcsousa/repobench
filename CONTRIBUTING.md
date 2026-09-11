@@ -24,10 +24,10 @@ the test suite.
 | --- | --- |
 | `repobench/core/` | Shared domain types, errors, ids, paths, git utilities, logging |
 | `repobench/repository/` | Repository ingestion: git history, GitHub enrichment, workload statistics |
-| `repobench/mining/` | Candidate mining: classification, complexity, subsystem, instruction provenance |
-| `repobench/tasks/` | Task packaging: diff split, instruction rendering, package reconstruction, leakage |
+| `repobench/mining/` | Candidate mining: classification, complexity, subsystem, instruction provenance; adaptive v0.9 adds repository-relative scope, candidate assessment (six deterministic component scores, `assessment.py`), benchmarkability/funnel aggregations and shadow mode |
+| `repobench/tasks/` | Task packaging: diff split, instruction rendering, package reconstruction, leakage (risk-level scan: only HIGH rejects) |
 | `repobench/validation/` | Validation checks and pipeline (PRD §77-82): baseline / no-op / oracle / regression / determinism |
-| `repobench/benchmark/` | Benchmark construction: sampling, coverage, health, manifests (PRD §83-89) |
+| `repobench/benchmark/` | Benchmark construction: sampling, coverage, health, manifests (PRD §83-89); adaptive v0.9 adds the coverage-aware validation queue (`priority.py`) |
 | `repobench/execution/` | Trial execution: runner pipeline (PRD §32, §41-43, §59-64), workspace lifecycle, environment sanitization, process handling, fingerprints, pricing catalog; `adapters/` for `claude`, `codex`, `opencode`, `gemini` and the generic command adapter |
 | `repobench/analysis/` | Analysis of run results: metrics, statistics, Pareto, recommendation (PRD §101-110) |
 | `repobench/reporting/` | Report rendering: terminal text and machine-readable JSON / JSONL / CSV (PRD §111-112) |
@@ -89,6 +89,13 @@ priorities (labels `P0` highest product value → `P2` later / opt-in):
 
 Planned waves:
 
+- **Adaptive candidate mining (v0.9, in flight).** `size_policy: adaptive`
+  replaces hard LOC caps with scored, explainable candidate assessment
+  (PRD in `docs/PRD-adaptive-candidate-mining.md`). Landed: scope/percentile
+  foundations, six component scores, coverage-aware validation queue with
+  budget, funnel/benchmarkability/inspect UX, leakage risk levels, shadow
+  mode. **The default is still `hard_caps`** — flipping it is gated on the
+  Field Validation Wave (30 repositories via `scripts/fieldrun.py`, PRD §47-57).
 - **Wave 4 — distribution:** [#20](https://github.com/felipcsousa/repobench/issues/20) [#21](https://github.com/felipcsousa/repobench/issues/21) [#22](https://github.com/felipcsousa/repobench/issues/22)
   Get benchmarks and reports out of one machine: CI integration, shareable
   reports, reusable bundles.

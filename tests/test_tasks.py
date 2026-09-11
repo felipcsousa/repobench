@@ -311,16 +311,20 @@ def test_scan_base_archive_clean_scores_78(tmp_path: Path) -> None:
     }
     assert report.checks["network_isolation"] is False
     assert all(report.checks[key] for key in report.checks if key != "network_isolation")
-    assert report.findings == []
+    assert report.evidence == []
+    assert report.risk == "LOW"
     assert report.score == 78  # 100 - 22: no network sandbox in host-native V1
 
 
 def test_scan_base_archive_detects_pr_reference(tmp_path: Path) -> None:
+    # PRD §44: "#9" is a GENERIC issue/PR reference — MEDIUM, a candidate
+    # warning, no longer the old substring-matching LEAKAGE_HIGH reject.
     fx = build_repo(tmp_path, readme="# calc\n\nSee #9 for the original discussion.\n")
     package = build_task_package(fx["repo"], make_candidate(fx), tmp_path / "pkg")
     report = scan_base_archive(package.metadata, package.base_tar)
-    assert report.findings and "README.md" in report.findings[0]
-    assert report.score == 78 - 15
+    assert report.risk == "MEDIUM"
+    assert report.evidence and "README.md" in report.evidence[0]
+    assert report.score == 78 - 10  # informational MEDIUM penalty
 
 
 def test_scan_base_archive_detects_gold_sha_prefix(tmp_path: Path) -> None:
@@ -334,17 +338,21 @@ def test_scan_base_archive_detects_gold_sha_prefix(tmp_path: Path) -> None:
     assert gitutil.archive_commit(fx["repo"], notes_base, tmp_path / "leaky.tar")
 
     # The needles derive from the metadata: a gold SHA whose 12-char prefix
-    # appears in the archive is a leak.
+    # appears in the archive is a HIGH leak (PRD §45) and the evidence names
+    # the file (PRD §46).
     metadata = package.metadata.model_copy(update={"gold_sha": leaked_sha})
     report = scan_base_archive(metadata, tmp_path / "leaky.tar")
-    assert report.findings and "NOTES.txt" in report.findings[0]
-    assert report.score == 78 - 15
+    assert report.risk == "HIGH"
+    assert report.evidence and "NOTES.txt" in report.evidence[0]
+    assert report.score == 78 - 40  # informational HIGH penalty
 
 
 def test_leakage_report_model_shape() -> None:
     report = LeakageReport(
         checks={"history_isolation": True, "network_isolation": False},
         score=78,
-        findings=[],
+        evidence=[],
+        risk="LOW",
     )
     assert report.score == 78
+    assert report.evidence == []

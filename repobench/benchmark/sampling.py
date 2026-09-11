@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from repobench.config import BenchmarkDimensions
-from repobench.core.types import TaskMetadata
+from repobench.core.types import Assessment, TaskMetadata
 
 
 def distribution_of(values: list[str]) -> dict[str, float]:
@@ -30,13 +30,21 @@ def tv_distance(sample_dist: dict[str, float], universe_dist: dict[str, float]) 
     )
 
 
-def _dimension_values(task: TaskMetadata) -> tuple[str, str, str]:
-    a = task.assessment
-    return (a.task_type.value, a.subsystem, a.complexity.value)
-
-
-# Index order of the dimensions in _dimension_values / dim_weights (PRD §66).
+# Index order of the dimensions in dimension_values / dim_weights (PRD §66).
 DIMENSION_NAMES = ("task_type", "subsystem", "complexity")
+
+
+def dimension_values(assessment: Assessment) -> tuple[str, str, str]:
+    """The assessment's key in each benchmark dimension, in DIMENSION_NAMES
+    order (PRD §66: task_type, subsystem, complexity) — the canonical
+    extraction that sampling, coverage and validation priority all consume, so
+    every consumer indexes the same tuple the same way."""
+    return (assessment.task_type.value, assessment.subsystem, assessment.complexity.value)
+
+
+def _dimension_values(task: TaskMetadata) -> tuple[str, str, str]:
+    """Thin task-level delegate: sampling itself works on TaskMetadata."""
+    return dimension_values(task.assessment)
 
 
 def greedy_stratified_sample(

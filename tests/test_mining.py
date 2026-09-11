@@ -9,8 +9,16 @@ from pathlib import Path
 import pytest
 
 from tests.fixtures.gitutil import git, make_pr, squash_pr
-from repobench.config import TaskMiningConfig
-from repobench.core.types import Complexity, IssueInfo, PRInfo, RejectionCode, TaskStatus, TaskType
+from repobench.config import ComplexityConfig, ProjectConfig, TaskMiningConfig
+from repobench.core.types import (
+    CandidateClass,
+    Complexity,
+    IssueInfo,
+    PRInfo,
+    RejectionCode,
+    TaskStatus,
+    TaskType,
+)
 from repobench.mining.candidates import mine_candidates
 from repobench.mining.classification import classify_task_type
 from repobench.mining.complexity import compute_complexity
@@ -418,3 +426,249 @@ def test_mine_candidates_history_unsupported(mining_repo: Path, monkeypatch: pyt
     assert candidates[0].status is TaskStatus.FILTERED
     assert candidates[0].rejection_code is RejectionCode.HISTORY_UNSUPPORTED
     assert candidates[0].assessment.subsystem == "unknown"
+
+
+# ------------------------------------------------------- adaptive mining (PRD v0.9)
+
+ADAPTIVE_CFG = TaskMiningConfig(
+    size_policy="adaptive",
+    complexity=ComplexityConfig(method="repository_percentile"),
+)
+
+DETECTED_PROJECT = ProjectConfig(
+    language="python",
+    package_manager="uv",
+    install_command="uv sync --frozen",
+    test_command="python -m pytest",
+    regression_command="python -m pytest",
+)
+
+
+def _lines(count: int) -> str:
+    return "value = 1\n" * count
+
+
+def _init_repo(tmp_path: Path, name: str) -> Path:
+    repo = tmp_path / name
+    repo.mkdir()
+    (repo / "README.md").write_text("demo\n")
+    git(repo, "init", "--quiet", "--initial-branch=main")
+    git(repo, "add", "-A")
+    git(repo, "commit", "--quiet", "-m", "initial")
+    return repo
+
+
+def _body_enricher(pr: PRInfo) -> PRInfo:
+    """Tier-B instruction for every PR: a clean, problem-oriented body."""
+    return pr.model_copy(
+        update={
+            "title": "fix: correct bulk import totals",
+            "body": (
+                "Users report bulk import totals drift whenever rows interleave "
+                "during import; totals must match the sum of the submitted rows."
+            ),
+        }
+    )
+
+
+def test_adaptive_discovers_large_pr_and_hard_caps_still_rejects(tmp_path: Path) -> None:
+    """PRD §1, §79-80: a 600-LOC PR across 3 files with tests, clean history
+    and a real instruction survives adaptive mining as a scored candidate
+    (complexity LARGE via the repository's own distribution), while the same
+    repository under the default hard_caps still filters it TASK_TOO_LARGE."""
+    repo = _init_repo(tmp_path, "large")
+    for number, size in ((1, 30), (2, 60), (3, 90), (4, 120)):
+        make_pr(
+            repo,
+            number,
+            f"feat/grow-{number}",
+            {f"src/a/grow{number}.py": _lines(size)},
+            f"add module {number}",
+        )
+    make_pr(
+        repo,
+        5,
+        "feat/big",
+        {
+            "src/payments/big1.py": _lines(200),
+            "src/payments/big2.py": _lines(200),
+            "src/payments/big3.py": _lines(200),
+            "tests/test_big1.py": _lines(40),
+            "tests/test_big2.py": _lines(34),
+        },
+        "add bulk importer",
+    )
+    make_pr(
+        repo,
+        6,
+        "feat/huge",
+        {"src/payments/huge.py": _lines(900), "tests/test_huge.py": _lines(5)},
+        "add huge exporter",
+    )
+
+    adaptive = mine_candidates(
+        GitRepo(repo), ADAPTIVE_CFG, enrich=_body_enricher, project_cfg=DETECTED_PROJECT
+    )
+    by_number = {candidate.pr.number: candidate for candidate in adaptive}
+
+    big = by_number[5]  # 600 impl LOC, 3 files, 2 test files, 74 test LOC
+    assert big.status is TaskStatus.DISCOVERED and big.rejection_code is None
+    # Hand-computed: 0.25*.75 + 0.25*.80 + 0.20*1.0 + 0.10*.90 + 0.10*1.0
+    # + 0.10*0.17 (P83.3) = 0.7945 -> 0.79 -> MEDIUM.
+    assert big.assessment.candidate_score == 0.79
+    assert big.assessment.candidate_class is CandidateClass.MEDIUM_CONFIDENCE
+    assert big.assessment.complexity is Complexity.LARGE  # P83.3 of this repository
+    assert big.assessment.scope_percentile == 83.3
+    assert big.assessment.behavioral_loc == 600 and big.assessment.generated_loc == 0
+    assert big.assessment.languages_touched == ["python"] and big.assessment.dirs_touched == 1
+    assert big.assessment.instruction_score == 0.75 and big.assessment.verifier_score == 0.80
+    assert big.assessment.risk_flags == ["large_diff", "small_repository_baseline"]
+    assert big.assessment.assessment_version == "adaptive-v1"
+
+    # The even bigger neighbor sits at P100: xlarge is a bucket only the
+    # repository-relative path can produce (PRD §19).
+    assert by_number[6].status is TaskStatus.DISCOVERED
+    assert by_number[6].assessment.complexity is Complexity.XLARGE
+
+    # Parity: hard_caps rejects the same PRs by absolute size and never scores.
+    hard_caps = mine_candidates(GitRepo(repo), TaskMiningConfig(), enrich=_body_enricher)
+    by_number_legacy = {candidate.pr.number: candidate for candidate in hard_caps}
+    assert by_number_legacy[5].status is TaskStatus.FILTERED
+    assert by_number_legacy[5].rejection_code is RejectionCode.TASK_TOO_LARGE
+    assert by_number_legacy[6].rejection_code is RejectionCode.TASK_TOO_LARGE
+    assert by_number_legacy[5].assessment.candidate_score is None
+    assert by_number_legacy[5].assessment.candidate_class is None
+    assert by_number_legacy[5].assessment.assessment_version is None
+
+
+def test_adaptive_no_implementation_change(tmp_path: Path) -> None:
+    """PRD §9: zero implementation LOC changes no implemented behavior — its
+    own hard gate in adaptive mode (hard_caps reports TASK_TOO_SMALL instead)."""
+    repo = _init_repo(tmp_path, "testonly")
+    make_pr(
+        repo,
+        1,
+        "test/only",
+        {"tests/test_only.py": "def test_only():\n    assert True\n"},
+        "add test",
+    )
+
+    adaptive = mine_candidates(GitRepo(repo), ADAPTIVE_CFG, enrich=_body_enricher)
+    assert adaptive[0].status is TaskStatus.FILTERED
+    assert adaptive[0].rejection_code is RejectionCode.NO_IMPLEMENTATION_CHANGE
+
+    hard_caps = mine_candidates(GitRepo(repo), TaskMiningConfig(), enrich=_body_enricher)
+    assert hard_caps[0].rejection_code is RejectionCode.TASK_TOO_SMALL
+
+
+def test_adaptive_small_pr_is_low_priority_not_rejected(tmp_path: Path) -> None:
+    """PRD §37: below min_implementation_loc is LOW_PRIORITY — low priority is
+    not invalidity, so no rejection code, and the PR is not scored."""
+    repo = _init_repo(tmp_path, "tiny")
+    make_pr(
+        repo,
+        1,
+        "feat/tip",
+        {"src/payments/tip.py": _lines(5), "tests/test_tip.py": _lines(1)},
+        "add tip",
+    )
+
+    candidates = mine_candidates(GitRepo(repo), ADAPTIVE_CFG, enrich=_body_enricher)
+    tiny = candidates[0]
+    assert tiny.status is TaskStatus.LOW_PRIORITY
+    assert tiny.rejection_code is None
+    assert tiny.assessment.candidate_score is None
+    assert tiny.assessment.assessment_version is None
+
+
+def test_adaptive_extreme_scope_guard(tmp_path: Path) -> None:
+    """PRD §39: the emergency cap still filters pathological diffs regardless
+    of the adaptive policy (lowered to 10 LOC here to reach it cheaply)."""
+    repo = _init_repo(tmp_path, "extreme")
+    make_pr(
+        repo,
+        1,
+        "feat/bulk",
+        {"src/payments/bulk.py": _lines(30), "tests/test_bulk.py": _lines(1)},
+        "add bulk",
+    )
+
+    cfg = ADAPTIVE_CFG.model_copy(update={"extreme_scope_loc": 10})
+    candidates = mine_candidates(GitRepo(repo), cfg, enrich=_body_enricher)
+    assert candidates[0].status is TaskStatus.FILTERED
+    assert candidates[0].rejection_code is RejectionCode.TASK_EXTREME_SCOPE
+
+
+def test_adaptive_experimental_class_is_low_priority(tmp_path: Path) -> None:
+    """PRD §24/§37: EXPERIMENTAL candidates stay eligible but out of the
+    default validation pool — title-only instruction, tiny tests and a
+    multi-package cross-language diff score 0.48 < 0.60."""
+    repo = _init_repo(tmp_path, "experimental")
+    make_pr(
+        repo,
+        1,
+        "refactor/stuff",
+        {
+            "pkg_a/mod.py": _lines(15),
+            "pkg_b/comp.ts": _lines(15),
+            "pkg_c/util.ts": _lines(10),
+            "tests/test_mod.py": _lines(2),
+        },
+        "refactor module structure",
+    )
+
+    def title_only(pr: PRInfo) -> PRInfo:
+        return pr.model_copy(update={"title": "refactor module structure"})
+
+    candidates = mine_candidates(GitRepo(repo), ADAPTIVE_CFG, enrich=title_only)
+    candidate = candidates[0]
+    assert candidate.status is TaskStatus.LOW_PRIORITY
+    assert candidate.rejection_code is None
+    assert candidate.assessment.candidate_score == 0.48
+    assert candidate.assessment.candidate_class is CandidateClass.EXPERIMENTAL
+    assert candidate.assessment.instruction_score == 0.45  # tier C, title-derived
+    assert candidate.assessment.languages_touched == ["python", "typescript"]
+    assert candidate.assessment.risk_flags == [
+        "cross_language",
+        "multi_package",
+        "small_repository_baseline",
+        "weak_verifier_evidence",
+        "xlarge_diff",
+    ]
+
+
+def test_adaptive_repository_percentile_yields_xlarge(tmp_path: Path) -> None:
+    """PRD §19: xlarge is a repository-relative bucket — the biggest of 25 PRs
+    sits at P100 and becomes xlarge (the absolute path never produces it), and
+    the baseline covers gated PRs too: n=25 clears the small-baseline flag."""
+    repo = _init_repo(tmp_path, "distribution")
+    for number in range(1, 25):
+        squash_pr(
+            repo,
+            number,
+            {f"src/pkg/mod{number}.py": _lines(5), f"tests/test_mod{number}.py": _lines(1)},
+            "touch module",
+        )
+    squash_pr(
+        repo,
+        25,
+        {"src/pkg/huge.py": _lines(500), "tests/test_huge.py": _lines(10)},
+        "add huge module",
+    )
+
+    candidates = mine_candidates(
+        GitRepo(repo), ADAPTIVE_CFG, enrich=_body_enricher, project_cfg=DETECTED_PROJECT
+    )
+    by_number = {candidate.pr.number: candidate for candidate in candidates}
+
+    biggest = by_number[25]
+    assert biggest.status is TaskStatus.DISCOVERED
+    assert biggest.assessment.complexity is Complexity.XLARGE  # P100 of 25 PRs
+    assert biggest.assessment.scope_percentile == 100.0
+    assert biggest.assessment.risk_flags == ["xlarge_diff"]
+
+    # A gated sub-floor PR keeps the absolute buckets and stays unscored.
+    small = by_number[7]
+    assert small.status is TaskStatus.LOW_PRIORITY
+    assert small.assessment.complexity is Complexity.SMALL
+    assert small.assessment.candidate_score is None

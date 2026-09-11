@@ -563,11 +563,14 @@ class TestSeedAndConfigCleanup:
         self, fixture_repo: Path, fake_agent_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Issue #35: analyze never validates (that happens in `benchmark build`),
-        # so the summary label must not claim it either.
+        # so the summary label must not claim it either. The v2 summary (PRD
+        # §30/§59) carries mining-time funnel stages only; a hard_caps repo has
+        # no scored classes, hence no "Estimated VALID" section at all.
         _fast_forward(fixture_repo, fake_agent_path, monkeypatch)
         result = _invoke("analyze")
-        assert "Candidates passing hard filters" in result.output
+        assert "With usable instructions" in result.output
         assert "Validated eval candidates" not in result.output
+        assert "Estimated VALID" not in result.output
 
 
 # ------------------------------------------------------- #4 runs / #9 clean

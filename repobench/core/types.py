@@ -49,10 +49,17 @@ class Complexity(str, enum.Enum):
     SMALL = "small"
     MEDIUM = "medium"
     LARGE = "large"
+    # Adaptive mining only (PRD §19): P95+ of the repository's own scope
+    # distribution. Never produced by the legacy absolute-bucket path.
+    XLARGE = "xlarge"
 
 
 class TaskStatus(str, enum.Enum):
     DISCOVERED = "DISCOVERED"
+    # Adaptive mining (PRD §37): FILTERED and LOW_PRIORITY are distinct — a low
+    # priority candidate is NOT invalid, only unlikely to be worth validating
+    # before better candidates.
+    LOW_PRIORITY = "LOW_PRIORITY"
     FILTERED = "FILTERED"
     PREPARING = "PREPARING"
     VALIDATING = "VALIDATING"
@@ -63,8 +70,16 @@ class TaskStatus(str, enum.Enum):
 class RejectionCode(str, enum.Enum):
     NO_TEST_CHANGE = "NO_TEST_CHANGE"
     NO_INSTRUCTION = "NO_INSTRUCTION"
+    # Adaptive mining (PRD §9): a PR must alter implemented behavior — a change
+    # with no implementation diff fails this gate regardless of size policy.
+    NO_IMPLEMENTATION_CHANGE = "NO_IMPLEMENTATION_CHANGE"
     TASK_TOO_SMALL = "TASK_TOO_SMALL"
+    # Kept for the legacy hard_caps size policy (PRD §34/§38): no longer a
+    # default adaptive rejection, but existing configs still produce it.
     TASK_TOO_LARGE = "TASK_TOO_LARGE"
+    # Extreme scope guard (PRD §39): the absolute emergency cap far above normal
+    # workload — pathological diffs only, never a complexity threshold.
+    TASK_EXTREME_SCOPE = "TASK_EXTREME_SCOPE"
     HISTORY_UNSUPPORTED = "HISTORY_UNSUPPORTED"
     BASELINE_BROKEN = "BASELINE_BROKEN"
     ENVIRONMENT_UNSUPPORTED = "ENVIRONMENT_UNSUPPORTED"
@@ -74,6 +89,65 @@ class RejectionCode(str, enum.Enum):
     FLAKY_VERIFIER = "FLAKY_VERIFIER"
     UNSAFE_TEST_SPLIT = "UNSAFE_TEST_SPLIT"
     LEAKAGE_HIGH = "LEAKAGE_HIGH"
+
+
+# Rejections that mean "would be eligible except for its size" (PRD §37): the
+# PRs whose fate the old cap decided. They stay inside the cap-pressure
+# population (repobench.mining.benchmarkability) and are exactly the
+# recoveries shadow mode counts (repobench.mining.shadow). Methodological
+# gates (history, instruction, verifier evidence, implementation exists)
+# remove a PR from that population instead. TASK_EXTREME_SCOPE is adaptive-only
+# (the legacy hard_caps path never emits it), so including it changes no
+# hard_caps-driven decision.
+SIZE_CLASS_REJECTIONS: frozenset[RejectionCode] = frozenset(
+    {
+        RejectionCode.TASK_TOO_SMALL,
+        RejectionCode.TASK_TOO_LARGE,
+        RejectionCode.TASK_EXTREME_SCOPE,
+    }
+)
+
+
+class CandidateClass(str, enum.Enum):
+    """Human-readable confidence class derived from candidate_score (PRD §24).
+
+    HIGH_CONFIDENCE / MEDIUM_CONFIDENCE / EXPERIMENTAL; thresholds live in
+    TaskMiningConfig.candidate_score and are subject to field calibration.
+
+    This enum is the one canonical mapping home for every external spelling of
+    the class: `short_label` names the terminal summary-table column and
+    `config_token` names the task_mining.validation.include vocabulary and
+    progress lines. CLI table builders, config parsing and progress renderers
+    all consume these properties instead of keeping private copies.
+    """
+
+    HIGH_CONFIDENCE = "HIGH_CONFIDENCE"
+    MEDIUM_CONFIDENCE = "MEDIUM_CONFIDENCE"
+    EXPERIMENTAL = "EXPERIMENTAL"
+
+    @property
+    def short_label(self) -> str:
+        """Compact terminal-table column spelling: HIGH / MED / EXP."""
+        return _CANDIDATE_CLASS_SHORT_LABELS[self]
+
+    @property
+    def config_token(self) -> str:
+        """task_mining.validation.include vocabulary: high / medium / experimental."""
+        return _CANDIDATE_CLASS_CONFIG_TOKENS[self]
+
+
+# The one mapping home for the external spellings above (see CandidateClass).
+_CANDIDATE_CLASS_SHORT_LABELS: dict[CandidateClass, str] = {
+    CandidateClass.HIGH_CONFIDENCE: "HIGH",
+    CandidateClass.MEDIUM_CONFIDENCE: "MED",
+    CandidateClass.EXPERIMENTAL: "EXP",
+}
+
+_CANDIDATE_CLASS_CONFIG_TOKENS: dict[CandidateClass, str] = {
+    CandidateClass.HIGH_CONFIDENCE: "high",
+    CandidateClass.MEDIUM_CONFIDENCE: "medium",
+    CandidateClass.EXPERIMENTAL: "experimental",
+}
 
 
 class TrialOutcome(str, enum.Enum):
@@ -169,6 +243,12 @@ class Assessment(BaseModel):
 
     Single source of truth for the 11 mining fields: carried by CandidateInfo
     and embedded (not mirrored) in TaskMetadata, so readers/writers share one API.
+
+    The adaptive-v1 assessment fields (PRD §68-69) follow the original 11: they
+    are all optional and None / empty means "not computed" — the output of
+    legacy hard_caps mining (PRD §34), which never scores candidates. Because
+    every new field defaults, previously persisted data_json rows written
+    before adaptive mining still validate unchanged.
     """
 
     task_type: TaskType = TaskType.UNKNOWN
@@ -182,6 +262,24 @@ class Assessment(BaseModel):
     test_loc: int = 0
     implementation_files: int = 0
     test_files: int = 0
+    # -- adaptive-v1 assessment fields (PRD §68); None = not computed --
+    candidate_score: float | None = None
+    candidate_class: CandidateClass | None = None
+    instruction_score: float | None = None
+    verifier_score: float | None = None
+    reconstructability_score: float | None = None
+    scope_score: float | None = None
+    isolation_score: float | None = None
+    environment_score: float | None = None
+    scope_percentile: float | None = None
+    generated_loc: int | None = None
+    behavioral_loc: int | None = None
+    dirs_touched: int | None = None
+    languages_touched: list[str] = Field(default_factory=list)
+    risk_flags: list[str] = Field(default_factory=list)
+    # Version of the scoring algorithm that produced the scores (PRD §69,
+    # e.g. "adaptive-v1") so historical benchmarks stay reproducible.
+    assessment_version: str | None = None
 
 
 class CandidateInfo(BaseModel):
@@ -282,6 +380,12 @@ class AnalyzeSummary(BaseModel):
     validated_candidates: int = 0
     workload: WorkloadDistribution = WorkloadDistribution()
     suggested_benchmark_size: int = 0
+    # Adaptive candidate-class counts (PRD §24, §30): the analyze service fills
+    # them only when adaptive mining scored the candidates; legacy hard_caps
+    # runs keep the zeros — no class was ever computed, and none is invented.
+    high_confidence: int = 0
+    medium_confidence: int = 0
+    experimental: int = 0
 
 
 class TrialResult(BaseModel):

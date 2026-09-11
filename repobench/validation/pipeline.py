@@ -7,8 +7,10 @@ inconclusive check (code=None, i.e. a verifier infrastructure problem) is treate
 as ENVIRONMENT_UNSUPPORTED so that a REJECTED report always carries a code. The
 invariant is simply: code None ⇒ inconclusive. A missing project.test_command
 rejects the task up front — without one no decisive check can execute, so VALID
-would be vacuous. A leakage report scoring below the threshold rejects the task
-with LEAKAGE_HIGH before any command is run (PRD §87).
+would be vacuous. A leakage report at risk HIGH rejects the task with
+LEAKAGE_HIGH before any command is run; MEDIUM is a candidate warning and LOW
+is clean — only HIGH gates (PRD §44-46, §87). The leakage score is
+informational and never decides the verdict.
 """
 
 from __future__ import annotations
@@ -28,6 +30,9 @@ from repobench.validation.noop import check_noop
 from repobench.validation.oracle import check_oracle
 from repobench.validation.regression import check_regression
 
+# Retained for backward compatibility with the pre-§45 score gate (external
+# tooling and old persisted references may still import it). No longer used
+# for the verdict: the gate is `risk != "HIGH"` (PRD §45).
 LEAKAGE_SCORE_THRESHOLD = 40
 
 _CHECKS = (check_baseline, check_noop, check_oracle, check_regression, check_determinism)
@@ -67,10 +72,12 @@ class TaskValidator:
             )
 
         if leakages is not None:
-            leakage_ok = leakages.score >= LEAKAGE_SCORE_THRESHOLD
-            details = f"leakage score {leakages.score}/100"
-            if leakages.findings:
-                details += "; findings: " + "; ".join(leakages.findings)
+            # Only HIGH is a hard reject (PRD §45); MEDIUM is a candidate
+            # warning and LOW is clean. The score is informational (PRD §46).
+            leakage_ok = leakages.risk != "HIGH"
+            details = f"leakage risk {leakages.risk} (score {leakages.score}/100, informational)"
+            if leakages.evidence:
+                details += "; evidence: " + "; ".join(leakages.evidence)
             checks.append(
                 CheckResult(
                     name="leakage",

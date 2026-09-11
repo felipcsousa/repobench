@@ -21,7 +21,7 @@ from repobench.core.types import (
     TaskStatus,
     TaskType,
 )
-from repobench.cli.render import render_analyze_summary, render_merge_style_warnings
+from repobench.cli.render import render_analyze_summary_v2, render_merge_style_warnings
 from repobench.cli.services import AnalyzeOutcome, analyze_repository
 from repobench.mining.candidates import mine_candidates
 from repobench.repository.git import GitRepo, MergeStyleCounts, slug_from_url
@@ -45,6 +45,9 @@ def git_repo(tmp_path: Path) -> Path:
     return repo
 
 
+# Legacy pre-adaptive shape (fixed candidate_id, UNKNOWN-type assessments with
+# no instruction/LOC): workload-share fixtures, not the adaptive scored
+# candidate built by tests.fixtures.candidates.make_assessed_candidate.
 def _candidate(
     task_type: TaskType = TaskType.UNKNOWN,
     subsystem: str = "unknown",
@@ -496,8 +499,11 @@ def test_analyze_repository_without_gh_claims_no_recall(
 
 
 def _analyze_outcome(**overrides: object) -> AnalyzeOutcome:
+    # Two typed candidates give the summary real workload shares to render
+    # (the v2 degrade path shows them for legacy, funnel-less outcomes).
+    workload_candidates = [_candidate(TaskType.BUGFIX), _candidate(TaskType.FEATURE)]
     data: dict[str, object] = dict(
-        summary=summarize_analysis(25, [], 5),
+        summary=summarize_analysis(25, workload_candidates, 5),
         candidates=[],
         merged_prs=25,
         enrichment="github",
@@ -513,11 +519,16 @@ def test_render_analyze_shows_merge_style_and_recall(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     outcome = _analyze_outcome()
-    render_analyze_summary(outcome, 5, "note")
+    render_analyze_summary_v2(outcome, 5, "note")
     render_merge_style_warnings(outcome)
     out = capsys.readouterr().out
-    assert "Merge style" in out and "12 merge commits · 13 squash" in out
-    assert "Recall vs GitHub" in out and "25/58 merged PRs (43%)" in out
+    # v2 summary: the mined count is the "Merged PRs" kv; the legacy degrade
+    # path (no funnel) still renders the workload shares and the size section.
+    assert "Merged PRs" in out and "25" in out
+    assert "Workload" in out and "bugfix" in out and "feature" in out
+    assert "Requested benchmark size" in out and "Tasks" in out
+    # issue #31 field-credibility notes are unchanged: squash provenance and
+    # the low-recall warning carry the gh ground truth (58) and the gap (33).
     assert (
         "⚠ merge style: 13 squash-merged PRs mined from commit subjects (#N) — "
         "no merge commits for them exist"
@@ -537,10 +548,11 @@ def test_render_analyze_without_gh_claims_no_recall(
         merge_styles=MergeStyleCounts(merge_commits=2, squash=0),
         recall_total=None,
     )
-    render_analyze_summary(outcome, 0, "note")
+    render_analyze_summary_v2(outcome, 0, "note")
     render_merge_style_warnings(outcome)
     out = capsys.readouterr().out
-    assert "2 merge commits" in out
+    assert "Merged PRs" in out and "2" in out
+    assert "Requested benchmark size" in out  # the size section still renders
     assert "Recall vs GitHub" not in out
     assert "recall" not in out.lower()  # gh unavailable — recall is never invented
     assert "⚠" not in out  # no squash PRs, no ground truth: no warnings

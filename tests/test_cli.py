@@ -14,7 +14,7 @@ from repobench.cli.app import app
 from repobench.config import ProjectConfig, RepoBenchConfig
 from repobench.core.types import ExecutionTarget
 from repobench.storage.db import Storage
-from tests.fixtures.gitutil import commit_all, git
+from tests.fixtures.gitutil import STATS_MODULE, build_repo, commit_all, git
 
 runner = CliRunner()
 
@@ -293,8 +293,11 @@ def test_candidates_after_analyze(fixture_repo: Path, monkeypatch: pytest.Monkey
     assert _invoke("init", "--yes").exit_code == 0
     analyzed = _invoke("analyze")
     assert analyzed.exit_code == 0, analyzed.output
-    assert "RepoBench analyzed your repository" in analyzed.output
+    # v2 summary (PRD §30/§59): funnel header replaces the legacy one; the
+    # hard_caps fixture has no scored classes, so no opportunity section.
+    assert "Repository Analysis" in analyzed.output
     assert "Merged PRs" in analyzed.output
+    assert "Benchmarkability" in analyzed.output
     assert "No inference tokens were consumed." in analyzed.output
 
     listing = _invoke("candidates")
@@ -310,6 +313,137 @@ def test_candidates_after_analyze(fixture_repo: Path, monkeypatch: pytest.Monkey
     storage = Storage(fixture_repo / ".repobench" / "state.db")
     statuses = {c.pr.number: c.status.value for c in storage.list_candidates()}
     assert statuses == {7: "DISCOVERED", 8: "FILTERED"}
+
+    # PRD §58: telemetry artifact carries funnel/rejection/class counts and
+    # NEVER the repository identity (it must not leave the machine by name).
+    telemetry = json.loads(
+        (fixture_repo / ".repobench" / "telemetry" / "analyze.json").read_text()
+    )
+    assert telemetry["funnel"]["merged_prs"] == 2
+    assert "NO_TEST_CHANGE" in telemetry["rejections"]
+    assert telemetry["benchmarkability"]["band"] in ("HIGH", "MEDIUM", "LOW")
+    assert "fixture_repo" not in json.dumps(telemetry)
+
+    # PRD §35: the table carries Score/Class columns ('—' under hard_caps).
+    assert "Score" in listing.output
+    assert "Class" in listing.output
+
+
+def test_candidate_inspect_shows_legacy_note_without_scores(
+    fixture_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(fixture_repo)
+    assert _invoke("init", "--yes").exit_code == 0
+    assert _invoke("analyze").exit_code == 0
+    inspected = _invoke("candidate", "inspect", "7")
+    assert inspected.exit_code == 0, inspected.output
+    # legacy hard_caps candidate: no scores, the renderer says so honestly
+    assert "PR #7" in inspected.output
+    assert "Legacy hard_caps mining" in inspected.output
+
+
+def test_candidate_inspect_unknown_pr_fails_politely(
+    fixture_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(fixture_repo)
+    assert _invoke("init", "--yes").exit_code == 0
+    assert _invoke("analyze").exit_code == 0
+    missing = _invoke("candidate", "inspect", "999")
+    assert missing.exit_code == 1
+    assert "no candidate recorded for PR #999" in missing.output
+
+
+def test_analyze_adaptive_scores_and_inspect_decomposes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Adaptive end-to-end through the CLI (PRD §30-36): analyze scores the
+    candidate, the summary shows the opportunity section, telemetry carries the
+    class counts, and `candidate inspect` decomposes the stored assessment."""
+    built = build_repo(
+        tmp_path / "r",
+        number=9,
+        extra_files={
+            "stats.py": STATS_MODULE,
+            # second test file with 45 LOC pushes the verifier-evidence
+            # component up (2 test files, 55 test LOC) so the candidate lands
+            # MEDIUM despite the title-only (tier C) instruction.
+            "tests/test_stats_extra.py": "\n".join(
+                f"# line {i} of the extra test module" for i in range(45)
+            )
+            + "\n",
+        },
+    )
+    repo = built["repo"]
+    monkeypatch.chdir(repo)
+    assert _invoke("init", "--yes").exit_code == 0
+    cfg_path = repo / "repobench.yml"
+    cfg = RepoBenchConfig.load(cfg_path)
+    cfg.task_mining.size_policy = "adaptive"
+    # init detected nothing in the bare fixture — a configured environment is
+    # what the environment component honestly scores.
+    cfg.project = ProjectConfig(
+        language="python",
+        test_command="python -m pytest",
+        regression_command="python -m pytest",
+    )
+    cfg.save(cfg_path)
+
+    analyzed = _invoke("analyze")
+    assert analyzed.exit_code == 0, analyzed.output
+    assert "Candidate opportunity" in analyzed.output
+    assert "High confidence" in analyzed.output
+    assert "Medium confidence" in analyzed.output
+    assert "Estimated VALID tasks" in analyzed.output
+
+    telemetry = json.loads(
+        (repo / ".repobench" / "telemetry" / "analyze.json").read_text()
+    )
+    assert telemetry["assessment_version"] == "adaptive-v1"
+    assert telemetry["candidate_classes"]["medium"] + telemetry["candidate_classes"]["high"] == 1
+
+    storage = Storage(repo / ".repobench" / "state.db")
+    scored = [
+        c
+        for c in storage.list_candidates()
+        if c.assessment.candidate_score is not None
+    ]
+    assert len(scored) == 1  # the single PR carries a full adaptive assessment
+
+    inspected = _invoke("candidate", "inspect", "9")
+    assert inspected.exit_code == 0, inspected.output
+    assert "Candidate Score" in inspected.output
+    assert "adaptive-v1" in inspected.output
+    # PRD §71: every component line present — the score is decomposable.
+    for component in (
+        "Instruction",
+        "Verifier",
+        "Reconstructability",
+        "Isolation",
+        "Environment",
+        "Scope",
+    ):
+        assert component in inspected.output
+    assert "Classification" in inspected.output
+
+
+def test_analyze_zero_candidates_teaches_the_way_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PRD §31: with no candidates at all, analyze explains the blockers and
+    the concrete knobs that could unlock yield — never a bare zero."""
+    built = build_repo(tmp_path / "r", number=9, test_source=None)  # no test change
+    repo = built["repo"]
+    monkeypatch.chdir(repo)
+    assert _invoke("init", "--yes").exit_code == 0
+    analyzed = _invoke("analyze")
+    assert analyzed.exit_code == 0, analyzed.output
+    assert "No candidates found." in analyzed.output
+    assert "Primary blockers:" in analyzed.output
+    assert "NO_TEST_CHANGE" in analyzed.output
+    assert "What to try:" in analyzed.output
+    assert "repository.lookback_days" in analyzed.output
+    # the honest recovery hint fires only with a real NO_TEST_CHANGE count
+    assert "project.test_command" in analyzed.output
 
 
 def test_candidates_without_analyze_hints_at_analyze(fixture_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
